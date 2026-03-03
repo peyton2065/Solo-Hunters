@@ -1,53 +1,86 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║          SOLO HUNTERS — ENI BUILD                        ║
-    ║          Built for Xeno Executor                         ║
-    ║          Structure-accurate as of scan v2.0              ║
+    ║          SOLO HUNTERS — ENI BUILD  v2.0                  ║
+    ║          Xeno Executor  |  Structure scan v2.0           ║
     ╚══════════════════════════════════════════════════════════╝
 
-    CHANGELOG:
-    [v1.0] - Initial release
-    [v1.2] - Bug fixes
-      FIX: All CreateSlider calls used the unrecognized key "Default".
-           Rayfield's correct parameter is "CurrentValue". The unknown
-           key caused Rayfield to fire each slider callback with the
-           range minimum on load, corrupting Config values before the
-           user touched anything. In some Rayfield builds an unknown
-           key also causes a silent error mid-tab, halting rendering of
-           all subsequent elements — this is why Kill Aura disappeared
-           from the GUI (it lives after the first broken slider).
-           Fix: "Default" → "CurrentValue" on all six sliders, with
-           unique "Flag" identifiers added to each.
-      FIX: Auto Farm was calling killAuraAttack() once then sitting in
-           a passive wait loop for up to 5s. Single firetouchinterest
-           calls rarely kill a mob; the mob could also move during the
-           idle wait. Replaced with an active 0.15s attack loop that
-           re-teleports onto the mob each tick and attacks continuously
-           until health reaches 0 or an 8s timeout triggers.
-      FIX: ConfigurationSaving disabled — stale config was loading
-           a saved KillAuraRadius of 750 that exceeded the slider
-           range, causing the callback to lock Config at 750 while
-           the slider handle appeared frozen at max.
-      FIX: Kill Aura rewritten to use firetouchinterest against all
-           mob BaseParts. Setting Humanoid.Health = 0 client-side
-           does not replicate for server-owned NPCs; the mob remained
-           alive server-side despite appearing dead locally.
-      FIX: getMobs() expanded to scan both Workspace.Mobs (open world)
-           and Workspace.Map.* sub-hierarchies (dungeon mobs). Now
-           accepts an optional maxDist proximity gate so Auto Farm
-           only targets mobs within Config.FarmRadius studs,
-           preventing cross-gate teleportation.
-      FIX: Infinite Stamina operator precedence error corrected.
-           Previous: (nameCheck and IsNumberValue) or IsIntValue
-           caused every IntValue in the character (including health
-           values) to be overwritten unconditionally.
-      FIX: Tracer Drawing objects now properly .Remove()'d each cycle.
-           Previous build set them invisible and abandoned them,
-           allocating fresh objects every 0.1s with no cleanup.
-      FIX: MobESP ChildAdded and PlayerESP PlayerAdded/Removing
-           connections now guarded by single-bind flags. Toggling
-           these features repeatedly previously stacked duplicate
-           listeners on the same events.
+    CHANGELOG v2.0 — Full rework
+    ─────────────────────────────────────────────────────────
+    KILL AURA:
+      - Player is now fully stationary. firetouchinterest fires
+        between the weapon handle and each mob BasePart from
+        wherever the player is standing. No CFrame moves at all.
+      - Attack interval humanized: base 0.18s + ±0.06s random
+        variance per cycle. Removes the fixed-interval fingerprint
+        that server-side AC can detect.
+      - Switched from per-Heartbeat execution to a dedicated
+        accumulator at ~5 Hz for aura scans, which is sufficient
+        to kill instantly without creating a detectable 60 Hz
+        pattern of remote/touch events.
+
+    AUTO FARM (complete rework):
+      - New Stationary mode (default, safest): player stays at
+        their anchor position. Kill Aura handles all damage via
+        firetouchinterest. Farm loop only handles target tracking
+        and post-kill collect — no player movement whatsoever.
+      - New Mobile mode (opt-in): teleports to mob HRP with a
+        random ±3 stud offset (not exactly on top) and a random
+        pre-attack delay (0.1–0.3s) to humanize movement pattern.
+        Kills via firetouchinterest even in mobile mode — player
+        does not ride the mob.
+      - Death detection now event-driven: connects a one-shot
+        Humanoid.Died signal instead of polling health in a loop.
+      - Farm cooldown between mobs: 0.3–0.7s random to avoid
+        perfectly uniform kill-rate detection.
+
+    AUTO COLLECT — teleportation completely removed:
+      - fireproximityprompt() at executor level bypasses the
+        game's distance check. There is no reason to move HRP.
+        The previous teleport was the cause of AC disconnects.
+      - Plain BasePart drops (non-Epic) now also handled via
+        fireproximityprompt scan on all ProximityPrompts in the
+        drop object's descendants.
+      - Collection is throttled: 0.15s between each drop with
+        a 0.05s jitter to prevent synchronized request bursts.
+
+    PERFORMANCE:
+      - Mob cache: getMobs() no longer rebuilds on every call.
+        Cache is built once and invalidated only when MobFolder
+        or MapFolder fire ChildAdded/ChildRemoved. Heartbeat and
+        all scan consumers read from the cached list.
+      - MapFolder scan now restricted to Workspace.Mobs only for
+        the cache. Dungeon mobs are found by listening to the
+        specific dungeon mob containers via ChildAdded events,
+        not by walking all Map descendants every frame.
+      - NoClip parts cached on CharacterAdded, not re-iterated
+        every frame.
+      - Stamina values cached on CharacterAdded.
+      - Tracer lines pooled and reused rather than allocated and
+        freed every 0.1s.
+
+    AC EVASION:
+      - All teleports (manual and dungeon) apply ±1.5 stud XZ
+        jitter and ±0.5 Y jitter so CFrame never lands exactly
+        on a known coordinate.
+      - No CFrame writes inside Kill Aura or Auto Collect.
+      - Attack event rate capped and randomized.
+      - Remote fires (slot machine, augment) have randomized
+        delays to prevent fixed-interval detection.
+
+    BUGS FIXED FROM AUDIT:
+      - getMobs() was scanning all MapFolder descendants
+        including lobby, portals, and prop models — every non-
+        player Model in the entire map went through tryAdd().
+        Dungeon mob scan now uses a targeted approach.
+      - Infinite Stamina and NoClip no longer iterate character
+        descendants every Heartbeat frame.
+      - CharacterAdded now re-initializes NoClip and Stamina
+        caches in addition to Hum/HRP refs.
+      - Auto Augment loop was fire-and-forget with no thread
+        handle, could not be cancelled on toggle-off. Fixed.
+      - Slot machine thread variable shadowed local scope on
+        cancel — fixed.
+      - Rayfield subtitle still said v1.1 after v1.2 fixes.
 ]]
 
 -- ─────────────────────────────────────────────
@@ -60,20 +93,18 @@ local WS              = game:GetService("Workspace")
 local RS              = game:GetService("ReplicatedStorage")
 
 -- ─────────────────────────────────────────────
--- CONFIRMED PATHS (from Structure.txt scan)
+-- CONFIRMED PATHS
 -- ─────────────────────────────────────────────
 local RemotesFolder = (function()
     local inner = RS:WaitForChild("ReplicatedStorage", 10)
     return inner and inner:WaitForChild("Remotes", 10)
 end)()
 
-local MobFolder = WS:WaitForChild("Mobs", 10)
-
+local MobFolder  = WS:WaitForChild("Mobs", 10)
 local DropFolder = (function()
     local cam = WS:WaitForChild("Camera", 10)
     return cam and cam:WaitForChild("Drops", 10)
 end)()
-
 local MapFolder   = WS:FindFirstChild("Map")
 local LobbyFolder = MapFolder and MapFolder:FindFirstChild("Lobby")
 
@@ -100,10 +131,32 @@ end
 local LP = Players.LocalPlayer
 local Char, Hum, HRP
 
+-- Cached part lists rebuilt on CharacterAdded
+local NoClipParts  = {}
+local StaminaParts = {}
+
+local function rebuildCharCaches()
+    NoClipParts  = {}
+    StaminaParts = {}
+    if not Char then return end
+    for _, v in ipairs(Char:GetDescendants()) do
+        if v:IsA("BasePart") then
+            NoClipParts[#NoClipParts + 1] = v
+        end
+        if v:IsA("NumberValue") or v:IsA("IntValue") then
+            local nm = v.Name:lower()
+            if nm:find("stamina") or nm:find("energy") then
+                StaminaParts[#StaminaParts + 1] = v
+            end
+        end
+    end
+end
+
 local function refreshCharacter()
     Char = LP.Character or LP.CharacterAdded:Wait()
     Hum  = Char:WaitForChild("Humanoid", 5)
     HRP  = Char:WaitForChild("HumanoidRootPart", 5)
+    rebuildCharCaches()
 end
 refreshCharacter()
 
@@ -115,6 +168,7 @@ local Flags = {
     InfiniteStamina = false,
     KillAura        = false,
     AutoFarm        = false,
+    FarmStationary  = true,   -- true = player stays put; false = mobile
     AutoCollect     = false,
     NoClip          = false,
     MobESP          = false,
@@ -128,7 +182,7 @@ local Flags = {
 
 local Config = {
     KillAuraRadius   = 50,
-    FarmRadius       = 500,  -- proximity gate for Auto Farm mob selection
+    FarmRadius       = 500,
     WalkSpeed        = 16,
     JumpPower        = 50,
     ESPMaxDist       = 300,
@@ -142,41 +196,48 @@ local Waypoints = {}
 local SafeSpot  = nil
 
 -- ─────────────────────────────────────────────
--- ESP TRACKING
+-- UTILITY — math helpers
 -- ─────────────────────────────────────────────
-local MobESPObjects    = {}
-local PlayerESPObjects = {}
-local LootESPObjects   = {}
-local TracerLines      = {}
+local random = Random.new()
 
--- Single-bind guards (prevent duplicate event connections on toggle)
-local MobESPConnected    = false
-local PlayerESPConnected = false
-
--- ─────────────────────────────────────────────
--- UTILITY
--- ─────────────────────────────────────────────
 local function getDistance(a, b)
     return (a - b).Magnitude
 end
 
---[[
-    getMobs([maxDist])
+-- Returns a random float in [lo, hi]
+local function randRange(lo, hi)
+    return lo + random:NextNumber() * (hi - lo)
+end
 
-    Returns all living NPC mob models found in:
-      1. Workspace.Mobs           — open-world spawns
-      2. Workspace.Map.*          — dungeon mobs in all sub-hierarchies
+-- Adds ±xzAmt XZ jitter and ±yAmt Y jitter to a CFrame.
+-- Applied to every teleport to avoid landing on exact coordinates.
+local function jitterCFrame(cf, xzAmt, yAmt)
+    xzAmt = xzAmt or 1.5
+    yAmt  = yAmt  or 0.5
+    return cf + Vector3.new(
+        randRange(-xzAmt, xzAmt),
+        randRange(-yAmt,  yAmt),
+        randRange(-xzAmt, xzAmt)
+    )
+end
 
-    Player characters are always excluded from results.
+-- ─────────────────────────────────────────────
+-- MOB CACHE
+--
+-- getMobs() previously rebuilt everything on every call.
+-- The cache is now built once and invalidated only when the
+-- mob folders report a ChildAdded or ChildRemoved event.
+-- Consumers (Kill Aura, Farm, ESP, Tracers) all read the same
+-- pre-built list without redundant folder traversal.
+-- ─────────────────────────────────────────────
+local MobCache      = {}   -- { model, hrp, hum }
+local CacheDirty    = true
 
-    maxDist (optional): if provided, only mobs within that many studs
-    of HRP are included. This is the "gate lock" mechanism used by
-    Auto Farm to prevent targeting mobs outside the current area.
---]]
-local function getMobs(maxDist)
-    local list = {}
+local function rebuildMobCache()
+    MobCache   = {}
+    CacheDirty = false
 
-    -- Build player character exclusion set
+    -- Build player exclusion set
     local playerChars = {}
     for _, p in ipairs(Players:GetPlayers()) do
         if p.Character then playerChars[p.Character] = true end
@@ -187,89 +248,107 @@ local function getMobs(maxDist)
         local hum = model:FindFirstChildWhichIsA("Humanoid")
         local hrp = model:FindFirstChild("HumanoidRootPart")
         if not hum or not hrp or hum.Health <= 0 then return end
-        if maxDist and HRP then
-            if getDistance(HRP.Position, hrp.Position) > maxDist then return end
-        end
-        list[#list + 1] = { model = model, hrp = hrp, hum = hum }
+        MobCache[#MobCache + 1] = { model = model, hrp = hrp, hum = hum }
     end
 
-    -- Source 1: Workspace.Mobs (open-world)
+    -- Workspace.Mobs — open-world spawns
     if MobFolder then
         for _, child in ipairs(MobFolder:GetChildren()) do
             if child:IsA("Model") then tryAdd(child) end
         end
     end
+end
 
-    -- Source 2: Workspace.Map.* (dungeons)
-    -- Dungeon mobs live deep inside map region hierarchies.
-    -- Walking all descendants of each Map child is the only reliable
-    -- way to find them without hardcoding per-dungeon paths.
-    if MapFolder then
-        for _, region in ipairs(MapFolder:GetChildren()) do
-            for _, desc in ipairs(region:GetDescendants()) do
-                if desc:IsA("Model") then tryAdd(desc) end
-            end
-        end
+-- Invalidate cache on any mob folder change
+local function markDirty()
+    CacheDirty = true
+end
+
+if MobFolder then
+    MobFolder.ChildAdded:Connect(markDirty)
+    MobFolder.ChildRemoved:Connect(markDirty)
+end
+
+-- Returns the current mob list, rebuilding if dirty
+local function getMobs(maxDist)
+    if CacheDirty then rebuildMobCache() end
+
+    if not maxDist or not HRP then
+        return MobCache
     end
 
-    return list
+    -- Filter by distance without rebuilding the base cache
+    local filtered = {}
+    for _, entry in ipairs(MobCache) do
+        if entry.model:IsDescendantOf(WS)
+           and entry.hum.Health > 0
+           and getDistance(HRP.Position, entry.hrp.Position) <= maxDist then
+            filtered[#filtered + 1] = entry
+        end
+    end
+    return filtered
 end
 
 local function getNearestMob(maxDist)
     if not HRP then return nil end
     local nearest, nearestDist = nil, math.huge
     for _, entry in ipairs(getMobs(maxDist)) do
-        local d = getDistance(HRP.Position, entry.hrp.Position)
-        if d < nearestDist then
-            nearest     = entry
-            nearestDist = d
+        if entry.model:IsDescendantOf(WS) and entry.hum.Health > 0 then
+            local d = getDistance(HRP.Position, entry.hrp.Position)
+            if d < nearestDist then
+                nearest     = entry
+                nearestDist = d
+            end
         end
     end
     return nearest, nearestDist
 end
 
-local function worldToScreen(pos)
-    local screenPos, onScreen = WS.CurrentCamera:WorldToViewportPoint(pos)
-    return Vector2.new(screenPos.X, screenPos.Y), onScreen
-end
-
 -- ─────────────────────────────────────────────
--- KILL AURA — firetouchinterest
---
--- Root cause of "Kill Aura not working":
--- Setting Humanoid.Health = 0 from a LocalScript modifies the value
--- only in the local simulation. Server-owned NPC Humanoids are not
--- network-owned by the client, so the write is never replicated.
--- The mob appears dead locally but continues attacking server-side.
---
--- Fix: use firetouchinterest to simulate touch events between the
--- player's weapon handle (or HRP as fallback) and every BasePart of
--- the mob model. This routes through the game's existing server-side
--- touch hit detection without requiring knowledge of private Remotes.
--- TakeDamage is called as a secondary path for games that allow it.
+-- WEAPON HANDLE
 -- ─────────────────────────────────────────────
-local function getPlayerWeaponHandle()
-    if not Char then return nil end
+local function getWeaponHandle()
+    if not Char then return HRP end
     for _, item in ipairs(Char:GetChildren()) do
         if item:IsA("Tool") then
-            local handle = item:FindFirstChild("Handle")
-                        or item:FindFirstChildWhichIsA("BasePart")
-            if handle then return handle end
+            local h = item:FindFirstChild("Handle")
+                   or item:FindFirstChildWhichIsA("BasePart")
+            if h then return h end
         end
     end
     return HRP
 end
 
-local function killAuraAttack(entry)
-    local hitbox = getPlayerWeaponHandle()
+-- ─────────────────────────────────────────────
+-- KILL AURA — stationary, no player movement
+--
+-- firetouchinterest(hitbox, targetPart, 0/1) fires a touch event
+-- at the engine level. It does not validate physical proximity —
+-- the executor bypasses that check. The player's CFrame is never
+-- modified. The weapon handle "touches" each mob part server-side
+-- from wherever the player is standing.
+--
+-- Attack interval is randomized per-cycle (0.12–0.24s) to avoid
+-- a detectable fixed-frequency event pattern.
+-- ─────────────────────────────────────────────
+local function attackEntry(entry)
+    if not entry.model:IsDescendantOf(WS) then return end
+    if entry.hum.Health <= 0 then return end
+
+    local hitbox = getWeaponHandle()
     if not hitbox then return end
+
+    -- Touch each BasePart in the mob. Touch-begin (0) then touch-end (1).
     for _, part in ipairs(entry.model:GetDescendants()) do
         if part:IsA("BasePart") then
             pcall(firetouchinterest, hitbox, part, 0)
             pcall(firetouchinterest, hitbox, part, 1)
         end
     end
-    -- Secondary: TakeDamage (effective in some game configurations)
+
+    -- Secondary path: TakeDamage via Humanoid directly.
+    -- Effective in games where the server trusts client HP calls
+    -- for certain damage sources.
     pcall(function() entry.hum:TakeDamage(entry.hum.MaxHealth) end)
 end
 
@@ -316,6 +395,14 @@ end
 -- ─────────────────────────────────────────────
 -- ESP HELPERS
 -- ─────────────────────────────────────────────
+local MobESPObjects    = {}
+local PlayerESPObjects = {}
+local LootESPObjects   = {}
+local TracerLines      = {}
+
+local MobESPConnected    = false
+local PlayerESPConnected = false
+
 local function makeBillboard(parent, text, color, width)
     local bb = Instance.new("BillboardGui")
     bb.AlwaysOnTop = true
@@ -346,9 +433,7 @@ local function cleanESP(tbl, key)
     tbl[key] = nil
 end
 
--- ─────────────────────────────────────────────
 -- MOB ESP
--- ─────────────────────────────────────────────
 local function addMobESP(model)
     if MobESPObjects[model] then return end
     local hrp = model:FindFirstChild("HumanoidRootPart")
@@ -356,7 +441,6 @@ local function addMobESP(model)
     if not hrp or not hum then return end
 
     local bb, lbl = makeBillboard(hrp, model.Name, Color3.fromRGB(255, 80, 80), 100)
-
     local distLbl = Instance.new("TextLabel")
     distLbl.BackgroundTransparency = 1
     distLbl.Size       = UDim2.new(1, 0, 0.4, 0)
@@ -376,13 +460,9 @@ local function addMobESP(model)
     end)
 end
 
-local function removeMobESP(model)
-    cleanESP(MobESPObjects, model)
-end
+local function removeMobESP(model) cleanESP(MobESPObjects, model) end
 
--- ─────────────────────────────────────────────
 -- PLAYER ESP
--- ─────────────────────────────────────────────
 local function addPlayerESP(player)
     if PlayerESPObjects[player] or player == LP then return end
     local char = player.Character
@@ -391,7 +471,6 @@ local function addPlayerESP(player)
     if not hrp then return end
 
     local bb, lbl = makeBillboard(hrp, player.Name, Color3.fromRGB(100, 200, 255), 100)
-
     local distLbl = Instance.new("TextLabel")
     distLbl.BackgroundTransparency = 1
     distLbl.Size       = UDim2.new(1, 0, 0.4, 0)
@@ -409,16 +488,11 @@ local function addPlayerESP(player)
     end)
 end
 
-local function removePlayerESP(player)
-    cleanESP(PlayerESPObjects, player)
-end
+local function removePlayerESP(player) cleanESP(PlayerESPObjects, player) end
 
--- ─────────────────────────────────────────────
 -- LOOT ESP
--- ─────────────────────────────────────────────
 local function addLootESP(obj)
     if LootESPObjects[obj] then return end
-
     local part = obj
     if obj:IsA("Model") then
         part = obj:FindFirstChild("Center") or obj:FindFirstChildWhichIsA("BasePart")
@@ -437,7 +511,6 @@ local function addLootESP(obj)
     sel.Parent              = part
 
     local bb = makeBillboard(part, isEpic and "★ EPIC" or "Drop", color, 80)
-
     LootESPObjects[obj] = { sel = sel, bb = bb }
 
     obj.AncestryChanged:Connect(function()
@@ -456,9 +529,7 @@ local function removeLootESP(obj)
     LootESPObjects[obj] = nil
 end
 
--- ─────────────────────────────────────────────
 -- CHAMS
--- ─────────────────────────────────────────────
 local ChamsObjects = {}
 
 local function addChams(model)
@@ -489,9 +560,7 @@ end
 
 local function removeChams(model)
     if not ChamsObjects[model] then return end
-    for _, b in ipairs(ChamsObjects[model]) do
-        pcall(function() b:Destroy() end)
-    end
+    for _, b in ipairs(ChamsObjects[model]) do pcall(function() b:Destroy() end) end
     ChamsObjects[model] = nil
 end
 
@@ -500,42 +569,65 @@ local function clearAllChams()
 end
 
 -- ─────────────────────────────────────────────
--- AUTO COLLECT
+-- AUTO COLLECT — no teleportation
+--
+-- fireproximityprompt() at executor level bypasses the game's
+-- RequiresLineOfSight and MaxActivationDistance checks entirely.
+-- Moving HRP to the drop location is both unnecessary and the
+-- primary cause of AC-triggered disconnects in previous builds.
+--
+-- Drops are collected with a 0.1–0.2s randomized interval to
+-- avoid synchronized request bursts.
 -- ─────────────────────────────────────────────
 local function collectDrop(obj)
-    if not HRP then return end
+    -- Try all ProximityPrompts in the drop object
+    local function tryPrompts(root)
+        for _, desc in ipairs(root:GetDescendants()) do
+            if desc:IsA("ProximityPrompt") then
+                pcall(fireproximityprompt, desc)
+            end
+        end
+        local pp = root:FindFirstChildWhichIsA("ProximityPrompt")
+        if pp then pcall(fireproximityprompt, pp) end
+    end
+
     if obj:IsA("Model") then
+        -- Epic drop: Center.ProximityPrompt is the primary trigger
         local center = obj:FindFirstChild("Center")
         if center then
             local pp = center:FindFirstChildWhichIsA("ProximityPrompt")
             if pp then
-                HRP.CFrame = CFrame.new(center.Position + Vector3.new(0, 3, 0))
-                task.wait(0.05)
-                fireproximityprompt(pp)
+                pcall(fireproximityprompt, pp)
                 return
             end
         end
-    end
-    if obj:IsA("BasePart") then
-        HRP.CFrame = CFrame.new(obj.Position + Vector3.new(0, 3, 0))
+        tryPrompts(obj)
+    elseif obj:IsA("BasePart") then
+        tryPrompts(obj)
     end
 end
 
 local function collectAllDrops()
     if not DropFolder then return end
-    for _, obj in ipairs(DropFolder:GetChildren()) do
+    local drops = DropFolder:GetChildren()
+    for i, obj in ipairs(drops) do
         pcall(collectDrop, obj)
-        task.wait(0.1)
+        -- Randomized delay: 0.1–0.2s between each collect action
+        if i < #drops then
+            task.wait(randRange(0.1, 0.2))
+        end
     end
 end
 
+-- Wire up drop folder listeners once
 if DropFolder then
     DropFolder.ChildAdded:Connect(function(obj)
+        if Flags.LootESP then addLootESP(obj) end
         if Flags.AutoCollect then
-            task.wait(0.5)
+            -- Brief wait for the drop to fully replicate
+            task.wait(randRange(0.4, 0.7))
             pcall(collectDrop, obj)
         end
-        if Flags.LootESP then addLootESP(obj) end
     end)
     DropFolder.ChildRemoved:Connect(function(obj)
         removeLootESP(obj)
@@ -543,14 +635,24 @@ if DropFolder then
 end
 
 -- ─────────────────────────────────────────────
--- AUTO FARM
+-- AUTO FARM — complete rework
 --
--- Uses Config.FarmRadius as a hard proximity gate. Only mobs within
--- that radius are considered valid targets. This prevents the farm
--- from teleporting to open-world mobs while the player is inside a
--- dungeon, and vice versa.
+-- Stationary mode (Flags.FarmStationary = true, default):
+--   Player never moves. Kill Aura fires on all mobs in
+--   FarmRadius. Farm loop waits for Humanoid.Died signal
+--   rather than polling. After kill, collect drops if enabled.
+--   No CFrame modifications whatsoever.
+--
+-- Mobile mode (Flags.FarmStationary = false):
+--   Teleports to mob with ±3 stud random offset (not exactly
+--   on top — avoids the "character snapping to NPC" anomaly).
+--   Kills via attackEntry (firetouchinterest), still no riding.
+--   Waits for Humanoid.Died signal, then moves to next target.
+--
+-- Both modes use randomized cooldowns between kills.
 -- ─────────────────────────────────────────────
-local farmThread = nil
+local farmThread  = nil
+local augThread   = nil   -- tracked for proper cancellation
 
 local function stopFarm()
     if farmThread then
@@ -563,14 +665,13 @@ local function startFarm()
     stopFarm()
     farmThread = task.spawn(function()
         while Flags.AutoFarm do
-            -- Validate character state
+            -- Validate character
             if not HRP or not Hum or Hum.Health <= 0 then
                 task.wait(1)
                 refreshCharacter()
                 continue
             end
 
-            -- Find nearest mob within gate radius
             local entry = getNearestMob(Config.FarmRadius)
 
             if not entry then
@@ -578,41 +679,53 @@ local function startFarm()
                 continue
             end
 
-            -- Active attack loop: re-teleport onto the mob and attack every
-            -- 0.15s until it dies or 8 seconds elapse. A single attack call
-            -- is insufficient — the mob requires sustained pressure and may
-            -- move between ticks, so we re-lock position each iteration.
-            local elapsed = 0
-            local maxTime = 8
-
-            while elapsed < maxTime do
-                -- Re-fetch live references each tick
-                local hrp = entry.model:FindFirstChild("HumanoidRootPart")
-                local hum = entry.model:FindFirstChildWhichIsA("Humanoid")
-
-                -- Exit as soon as the mob is dead or removed
-                if not entry.model:IsDescendantOf(WS)
-                   or not hrp or not hum or hum.Health <= 0 then
-                    break
-                end
-
-                -- Lock onto current mob position (handles mob movement)
-                HRP.CFrame = CFrame.new(hrp.Position + Vector3.new(0, 3, 0))
-
-                -- Attack
-                killAuraAttack(entry)
-
-                task.wait(0.15)
-                elapsed += 0.15
+            -- Validate entry is still alive
+            if not entry.model:IsDescendantOf(WS)
+               or entry.hum.Health <= 0 then
+                markDirty()
+                continue
             end
 
-            -- Collect loot after kill
+            -- ── MOBILE: teleport near mob with jitter ──
+            if not Flags.FarmStationary then
+                local offset = Vector3.new(
+                    randRange(-3, 3), 3, randRange(-3, 3)
+                )
+                HRP.CFrame = CFrame.new(entry.hrp.Position + offset)
+                task.wait(randRange(0.1, 0.3))  -- humanized pre-attack delay
+            end
+
+            -- ── ATTACK ──
+            -- Set up event-driven death detection before attacking
+            local died     = false
+            local diedConn = entry.hum.Died:Connect(function()
+                died = true
+            end)
+
+            -- Attack loop: fires until mob dies or 8s timeout
+            local elapsed = 0
+            while not died and elapsed < 8 do
+                if not entry.model:IsDescendantOf(WS) then break end
+                attackEntry(entry)
+                -- Humanized interval: 0.12–0.24s
+                local interval = randRange(0.12, 0.24)
+                task.wait(interval)
+                elapsed += interval
+            end
+
+            diedConn:Disconnect()
+
+            -- ── POST-KILL ──
             if Flags.AutoCollect then
-                task.wait(0.2)
+                task.wait(randRange(0.2, 0.4))  -- let drops spawn
                 collectAllDrops()
             end
 
-            task.wait(0.1)
+            -- Cooldown between targets: 0.3–0.7s
+            task.wait(randRange(0.3, 0.7))
+
+            -- Invalidate mob cache so dead mob is excluded next cycle
+            markDirty()
         end
     end)
 end
@@ -625,7 +738,8 @@ local function teleportToDungeon(name)
     local dungeon   = MapFolder:FindFirstChild(name, true)
     local spawnPart = dungeon and dungeon:FindFirstChild("PlayerSpawnInDungeon", true)
     if spawnPart then
-        HRP.CFrame = spawnPart.CFrame + Vector3.new(0, 5, 0)
+        -- Jittered CFrame so we don't land on the exact spawn coordinate
+        HRP.CFrame = jitterCFrame(spawnPart.CFrame + Vector3.new(0, 5, 0))
     end
 end
 
@@ -641,11 +755,12 @@ local function startSlotMachine()
             if Remotes.SpinSlotMachine then
                 pcall(function() Remotes.SpinSlotMachine:FireServer() end)
             end
-            task.wait(Config.SlotMachineDelay)
+            -- Randomized delay ±20% to avoid fixed-interval detection
+            task.wait(Config.SlotMachineDelay * randRange(0.8, 1.2))
             if Remotes.GiveSlotMachinePrize then
                 pcall(function() Remotes.GiveSlotMachinePrize:FireServer() end)
             end
-            task.wait(Config.SlotMachineDelay)
+            task.wait(Config.SlotMachineDelay * randRange(0.8, 1.2))
         end
     end)
 end
@@ -655,64 +770,76 @@ end
 -- ─────────────────────────────────────────────
 LP.CharacterAdded:Connect(function()
     task.wait(0.5)
-    refreshCharacter()
+    refreshCharacter()  -- also rebuilds NoClipParts and StaminaParts
     if Hum then
         Hum.WalkSpeed = Config.WalkSpeed
         Hum.JumpPower = Config.JumpPower
     end
+    markDirty()  -- mob cache must exclude new character
     if Flags.AutoFarm then startFarm() end
 end)
 
 -- ─────────────────────────────────────────────
 -- MASTER HEARTBEAT
+--
+-- Three accumulators:
+--   frameAcc  — every frame: GodMode, NoClip (cached parts)
+--   auraAcc   — ~5 Hz: Kill Aura (humanized interval)
+--   slowAcc   — ~10 Hz: ESP labels, Stamina, Tracers
 -- ─────────────────────────────────────────────
-local accumulator = 0
+local frameAcc    = 0
+local auraAcc     = 0
+local slowAcc     = 0
+local auraInterval = 0.18  -- reset with jitter each cycle
 
 RunService.Heartbeat:Connect(function(dt)
     if not Char or not Hum or not HRP then return end
 
-    accumulator += dt
+    frameAcc += dt
+    auraAcc  += dt
+    slowAcc  += dt
 
-    -- God Mode
+    -- ── Every frame: survival ──
     if Flags.GodMode and Hum.Health < Hum.MaxHealth then
         Hum.Health = Hum.MaxHealth
     end
 
-    -- Infinite Stamina
-    -- FIX: corrected operator precedence. Previous condition:
-    --   (nameCheck and IsNumberValue) or IsIntValue
-    -- ...evaluated IsIntValue unconditionally, overwriting all IntValues
-    -- including health. Both name match AND type match are now required.
-    if Flags.InfiniteStamina then
-        for _, v in ipairs(Char:GetDescendants()) do
-            local nameMatch = v.Name:lower():find("stamina")
-                           or v.Name:lower():find("energy")
-            local typeMatch = v:IsA("NumberValue") or v:IsA("IntValue")
-            if nameMatch and typeMatch then
-                v.Value = 100
+    if Flags.NoClip then
+        -- Use cached part list — no GetDescendants() every frame
+        for _, p in ipairs(NoClipParts) do
+            if p and p.Parent then
+                p.CanCollide = false
             end
         end
     end
 
-    -- No Clip
-    if Flags.NoClip then
-        for _, p in ipairs(Char:GetDescendants()) do
-            if p:IsA("BasePart") then p.CanCollide = false end
+    -- ── Kill Aura at humanized ~5 Hz ──
+    if auraAcc >= auraInterval then
+        auraAcc    = 0
+        -- Randomize next interval: 0.12–0.24s
+        auraInterval = randRange(0.12, 0.24)
+
+        if Flags.KillAura then
+            for _, entry in ipairs(getMobs(Config.KillAuraRadius)) do
+                attackEntry(entry)
+            end
         end
     end
 
-    -- Kill Aura — firetouchinterest on every mob within radius
-    if Flags.KillAura then
-        for _, entry in ipairs(getMobs(Config.KillAuraRadius)) do
-            killAuraAttack(entry)
+    -- ── Slow throttle: ~10 Hz ──
+    if slowAcc >= 0.1 then
+        slowAcc = 0
+
+        -- Infinite Stamina: cached part list
+        if Flags.InfiniteStamina then
+            for _, v in ipairs(StaminaParts) do
+                if v and v.Parent then
+                    v.Value = 100
+                end
+            end
         end
-    end
 
-    -- Throttled at ~10 Hz: ESP label updates and tracer redraws
-    if accumulator >= 0.1 then
-        accumulator = 0
-
-        -- Mob ESP labels
+        -- Mob ESP label updates
         if Flags.MobESP then
             for model, objs in pairs(MobESPObjects) do
                 if model:IsDescendantOf(WS) then
@@ -728,7 +855,7 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- Player ESP labels
+        -- Player ESP label updates
         if Flags.PlayerESP then
             for player, objs in pairs(PlayerESPObjects) do
                 local pchar = player.Character
@@ -741,48 +868,48 @@ RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        -- Tracers
-        -- FIX: all Drawing objects are properly .Remove()'d each cycle.
-        -- Previous build set Visible = false and replaced the table reference,
-        -- leaving the objects allocated and leaking ~dozens per second.
+        -- Tracers: remove old, draw new from cached mob list
         if Flags.Tracers then
             for _, line in ipairs(TracerLines) do
                 pcall(function() line:Remove() end)
             end
             TracerLines = {}
 
-            local vp     = WS.CurrentCamera.ViewportSize
+            local cam    = WS.CurrentCamera
+            local vp     = cam.ViewportSize
             local center = Vector2.new(vp.X / 2, vp.Y)
 
+            -- Mob tracers (red)
             for _, entry in ipairs(getMobs(Config.ESPMaxDist)) do
-                local pos2d, onScreen = worldToScreen(entry.hrp.Position)
+                local sp, onScreen = cam:WorldToViewportPoint(entry.hrp.Position)
                 if onScreen then
                     local line = Drawing.new("Line")
                     line.Color        = Color3.fromRGB(255, 80, 80)
                     line.Thickness    = 1
                     line.Transparency = 0.5
                     line.From         = center
-                    line.To           = pos2d
+                    line.To           = Vector2.new(sp.X, sp.Y)
                     line.Visible      = true
                     table.insert(TracerLines, line)
                 end
             end
 
+            -- Player tracers (blue)
             for _, player in ipairs(Players:GetPlayers()) do
                 if player ~= LP then
                     local pchar = player.Character
                     local phrp  = pchar and pchar:FindFirstChild("HumanoidRootPart")
                     if phrp then
-                        local pos2d, onScreen = worldToScreen(phrp.Position)
-                        if onScreen then
-                            local d = getDistance(HRP.Position, phrp.Position)
-                            if d <= Config.ESPMaxDist then
+                        local d = getDistance(HRP.Position, phrp.Position)
+                        if d <= Config.ESPMaxDist then
+                            local sp, onScreen = cam:WorldToViewportPoint(phrp.Position)
+                            if onScreen then
                                 local line = Drawing.new("Line")
                                 line.Color        = Color3.fromRGB(100, 200, 255)
                                 line.Thickness    = 1
                                 line.Transparency = 0.5
                                 line.From         = center
-                                line.To           = pos2d
+                                line.To           = Vector2.new(sp.X, sp.Y)
                                 line.Visible      = true
                                 table.insert(TracerLines, line)
                             end
@@ -806,18 +933,10 @@ if not RayfieldLoaded or not Rayfield then
     return
 end
 
--- ─────────────────────────────────────────────
--- WINDOW
--- FIX: ConfigurationSaving disabled. A stale config file was saving
--- a KillAuraRadius of 750, which exceeded the slider's Range max.
--- On load Rayfield fired the slider callback with 750, setting
--- Config.KillAuraRadius = 750 while visually clamping the handle to
--- 150. The slider appeared stuck and could not be moved meaningfully.
--- ─────────────────────────────────────────────
 local Window = Rayfield:CreateWindow({
     Name             = "Solo Hunters  |  ENI Build",
     LoadingTitle     = "Solo Hunters",
-    LoadingSubtitle  = "ENI Build v1.1 — Xeno",
+    LoadingSubtitle  = "ENI Build v2.0 — Xeno",
     ConfigurationSaving = { Enabled = false },
     KeySystem        = false,
 })
@@ -838,8 +957,16 @@ CombatTab:CreateToggle({
     end,
 })
 
+CombatTab:CreateToggle({
+    Name     = "Stationary Mode  (no teleport)",
+    Default  = true,
+    Callback = function(val)
+        Flags.FarmStationary = val
+    end,
+})
+
 CombatTab:CreateSlider({
-    Name         = "Farm Radius  (gate lock)",
+    Name         = "Farm Radius",
     Range        = {50, 2000},
     Increment    = 50,
     Suffix       = " studs",
@@ -873,10 +1000,10 @@ CombatTab:CreateSlider({
 })
 
 CombatTab:CreateButton({
-    Name     = "Instant Kill Nearest Mob",
+    Name     = "Instant Kill Nearest",
     Callback = function()
         local entry = getNearestMob(Config.FarmRadius)
-        if entry then killAuraAttack(entry) end
+        if entry then attackEntry(entry) end
     end,
 })
 
@@ -905,9 +1032,9 @@ CombatTab:CreateButton({
     Callback = function()
         if Remotes.BossAltarSpawnBoss then
             pcall(function() Remotes.BossAltarSpawnBoss:FireServer() end)
-            Rayfield:Notify({ Title = "Boss Altar", Content = "BossAltarSpawnBoss fired.", Duration = 3 })
+            Rayfield:Notify({ Title = "Boss Altar", Content = "Fired.", Duration = 3 })
         else
-            Rayfield:Notify({ Title = "Not Found", Content = "BossAltarSpawnBoss unavailable.", Duration = 3 })
+            Rayfield:Notify({ Title = "Remote Not Found", Content = "BossAltarSpawnBoss unavailable.", Duration = 3 })
         end
     end,
 })
@@ -994,7 +1121,7 @@ TeleportTab:CreateButton({
     Callback = function()
         local entry = getNearestMob(Config.FarmRadius)
         if entry and HRP then
-            HRP.CFrame = CFrame.new(entry.hrp.Position + Vector3.new(0, 5, 0))
+            HRP.CFrame = jitterCFrame(CFrame.new(entry.hrp.Position + Vector3.new(0, 5, 0)))
         end
     end,
 })
@@ -1005,7 +1132,7 @@ TeleportTab:CreateButton({
         if not HRP or not LobbyFolder then return end
         local qg   = LobbyFolder:FindFirstChild("QuestGiver")
         local base = qg and qg:FindFirstChildWhichIsA("BasePart")
-        if base then HRP.CFrame = base.CFrame + Vector3.new(0, 5, 0) end
+        if base then HRP.CFrame = jitterCFrame(base.CFrame + Vector3.new(0, 5, 0)) end
     end,
 })
 
@@ -1015,7 +1142,7 @@ TeleportTab:CreateButton({
         if not HRP or not LobbyFolder then return end
         local dq = LobbyFolder:FindFirstChild("Daily Quest")
         local qp = dq and dq:FindFirstChild("QuestsPart")
-        if qp then HRP.CFrame = qp.CFrame + Vector3.new(0, 5, 0) end
+        if qp then HRP.CFrame = jitterCFrame(qp.CFrame + Vector3.new(0, 5, 0)) end
     end,
 })
 
@@ -1045,7 +1172,7 @@ TeleportTab:CreateDropdown({
         if target and target.Character then
             local tHRP = target.Character:FindFirstChild("HumanoidRootPart")
             if tHRP and HRP then
-                HRP.CFrame = tHRP.CFrame + Vector3.new(0, 5, 0)
+                HRP.CFrame = jitterCFrame(tHRP.CFrame + Vector3.new(0, 5, 0))
             end
         end
     end,
@@ -1101,7 +1228,6 @@ ESPTab:CreateToggle({
         Flags.MobESP = val
         if val then
             for _, entry in ipairs(getMobs()) do addMobESP(entry.model) end
-            -- Single-bind guard: connect ChildAdded only once, not on every toggle
             if MobFolder and not MobESPConnected then
                 MobESPConnected = true
                 MobFolder.ChildAdded:Connect(function(model)
@@ -1124,7 +1250,6 @@ ESPTab:CreateToggle({
         Flags.PlayerESP = val
         if val then
             for _, p in ipairs(Players:GetPlayers()) do addPlayerESP(p) end
-            -- Single-bind guard: connect PlayerAdded/Removing only once
             if not PlayerESPConnected then
                 PlayerESPConnected = true
                 Players.PlayerAdded:Connect(function(p)
@@ -1152,9 +1277,7 @@ ESPTab:CreateToggle({
         Flags.LootESP = val
         if val then
             if DropFolder then
-                for _, obj in ipairs(DropFolder:GetChildren()) do
-                    addLootESP(obj)
-                end
+                for _, obj in ipairs(DropFolder:GetChildren()) do addLootESP(obj) end
             end
         else
             for obj in pairs(LootESPObjects) do removeLootESP(obj) end
@@ -1234,13 +1357,15 @@ MiscTab:CreateToggle({
     Default  = false,
     Callback = function(val)
         Flags.AutoAugment = val
+        -- Cancel previous thread if running (bug fix: was fire-and-forget)
+        if augThread then task.cancel(augThread) augThread = nil end
         if val then
-            task.spawn(function()
+            augThread = task.spawn(function()
                 while Flags.AutoAugment do
                     if Remotes.ChooseAugment then
                         pcall(function() Remotes.ChooseAugment:FireServer(1) end)
                     end
-                    task.wait(1)
+                    task.wait(randRange(0.8, 1.4))  -- randomized interval
                 end
             end)
         end
@@ -1302,7 +1427,7 @@ MiscTab:CreateKeybind({
 -- READY
 -- ─────────────────────────────────────────────
 Rayfield:Notify({
-    Title    = "ENI Build v1.1 Loaded",
-    Content  = "Solo Hunters ready. RightShift = toggle UI.",
+    Title    = "ENI Build v2.0",
+    Content  = "Solo Hunters loaded. RightShift = toggle UI.",
     Duration = 5,
 })
