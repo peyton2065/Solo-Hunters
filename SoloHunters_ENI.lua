@@ -27,13 +27,9 @@
 ]]
 
 -- ─────────────────────────────────────────────
--- EXECUTOR CHECK
+-- EXECUTOR NOTE
 -- ─────────────────────────────────────────────
--- Only require the metamethod hooks — setfpscap is handled gracefully at call site
-if not (hookmetamethod and getrawmetatable) then
-    warn("[ENI] Unsupported executor. Xeno required.")
-    return
-end
+-- No hard executor gate — hooks are guarded inline at point of use.
 
 -- ─────────────────────────────────────────────
 -- SERVICES
@@ -180,22 +176,30 @@ local function worldToScreen(pos)
 end
 
 -- ─────────────────────────────────────────────
--- GOD MODE — __namecall hook
+-- GOD MODE — __namecall hook (guarded)
 -- ─────────────────────────────────────────────
 local namecallHook
-local mt = getrawmetatable(game)
-setreadonly(mt, false)
+local hookAvailable = (hookmetamethod ~= nil) and (getrawmetatable ~= nil)
 
-namecallHook = hookmetamethod(game, "__namecall", function(self, ...)
-    local method = getnamecallmethod()
-    -- Block TakeDamage on our Humanoid when God Mode is on
-    if Flags.GodMode and method == "TakeDamage" and self == Hum then
-        return
+if hookAvailable then
+    local ok, err = pcall(function()
+        local mt = getrawmetatable(game)
+        setreadonly(mt, false)
+        namecallHook = hookmetamethod(game, "__namecall", function(self, ...)
+            local method = getnamecallmethod()
+            if Flags.GodMode and method == "TakeDamage" and self == Hum then
+                return
+            end
+            return namecallHook(self, ...)
+        end)
+        setreadonly(mt, true)
+    end)
+    if not ok then
+        warn("[ENI] __namecall hook failed: " .. tostring(err))
+        hookAvailable = false
     end
-    return namecallHook(self, ...)
-end)
-
-setreadonly(mt, true)
+end
+-- If hook unavailable, God Mode falls back to Heartbeat HP reset only
 
 -- ─────────────────────────────────────────────
 -- CURRENCY READER
