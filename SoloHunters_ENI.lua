@@ -29,7 +29,8 @@
 -- ─────────────────────────────────────────────
 -- EXECUTOR CHECK
 -- ─────────────────────────────────────────────
-if not (hookmetamethod and getrawmetatable and setfpscap) then
+-- Only require the metamethod hooks — setfpscap is handled gracefully at call site
+if not (hookmetamethod and getrawmetatable) then
     warn("[ENI] Unsupported executor. Xeno required.")
     return
 end
@@ -1261,8 +1262,17 @@ MiscTab:CreateSection("Utility")
 MiscTab:CreateButton({
     Name     = "FPS Unlocker",
     Callback = function()
-        setfpscap(0)
-        Rayfield:Notify({ Title = "FPS Unlocker", Content = "FPS cap removed.", Duration = 3 })
+        if setfpscap then
+            setfpscap(0)
+            Rayfield:Notify({ Title = "FPS Unlocker", Content = "FPS cap removed.", Duration = 3 })
+        else
+            pcall(function()
+                local fn = (getfenv and getfenv(0).setfpscap)
+                        or (syn and syn.setfpscap)
+                if fn then fn(0) end
+            end)
+            Rayfield:Notify({ Title = "FPS Unlocker", Content = "Attempted — check executor if no change.", Duration = 4 })
+        end
     end,
 })
 
