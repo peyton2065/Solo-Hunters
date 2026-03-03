@@ -7,7 +7,23 @@
 
     CHANGELOG:
     [v1.0] - Initial release
-    [v1.1] - Bug fixes
+    [v1.2] - Bug fixes
+      FIX: All CreateSlider calls used the unrecognized key "Default".
+           Rayfield's correct parameter is "CurrentValue". The unknown
+           key caused Rayfield to fire each slider callback with the
+           range minimum on load, corrupting Config values before the
+           user touched anything. In some Rayfield builds an unknown
+           key also causes a silent error mid-tab, halting rendering of
+           all subsequent elements — this is why Kill Aura disappeared
+           from the GUI (it lives after the first broken slider).
+           Fix: "Default" → "CurrentValue" on all six sliders, with
+           unique "Flag" identifiers added to each.
+      FIX: Auto Farm was calling killAuraAttack() once then sitting in
+           a passive wait loop for up to 5s. Single firetouchinterest
+           calls rarely kill a mob; the mob could also move during the
+           idle wait. Replaced with an active 0.15s attack loop that
+           re-teleports onto the mob each tick and attacks continuously
+           until health reaches 0 or an 8s timeout triggers.
       FIX: ConfigurationSaving disabled — stale config was loading
            a saved KillAuraRadius of 750 that exceeded the slider
            range, causing the callback to lock Config at 750 while
@@ -547,36 +563,56 @@ local function startFarm()
     stopFarm()
     farmThread = task.spawn(function()
         while Flags.AutoFarm do
+            -- Validate character state
             if not HRP or not Hum or Hum.Health <= 0 then
                 task.wait(1)
                 refreshCharacter()
                 continue
             end
 
+            -- Find nearest mob within gate radius
             local entry = getNearestMob(Config.FarmRadius)
 
-            if entry then
-                HRP.CFrame = CFrame.new(entry.hrp.Position + Vector3.new(0, 3, 0))
-                task.wait(0.1)
-
-                killAuraAttack(entry)
-
-                -- Wait for mob death (confirmed by removal from hierarchy)
-                local elapsed = 0
-                while entry.model:IsDescendantOf(WS) and elapsed < 5 do
-                    task.wait(0.1)
-                    elapsed += 0.1
-                end
-
-                if Flags.AutoCollect then
-                    task.wait(0.3)
-                    collectAllDrops()
-                end
-            else
+            if not entry then
                 task.wait(1)
+                continue
             end
 
-            task.wait(0.2)
+            -- Active attack loop: re-teleport onto the mob and attack every
+            -- 0.15s until it dies or 8 seconds elapse. A single attack call
+            -- is insufficient — the mob requires sustained pressure and may
+            -- move between ticks, so we re-lock position each iteration.
+            local elapsed = 0
+            local maxTime = 8
+
+            while elapsed < maxTime do
+                -- Re-fetch live references each tick
+                local hrp = entry.model:FindFirstChild("HumanoidRootPart")
+                local hum = entry.model:FindFirstChildWhichIsA("Humanoid")
+
+                -- Exit as soon as the mob is dead or removed
+                if not entry.model:IsDescendantOf(WS)
+                   or not hrp or not hum or hum.Health <= 0 then
+                    break
+                end
+
+                -- Lock onto current mob position (handles mob movement)
+                HRP.CFrame = CFrame.new(hrp.Position + Vector3.new(0, 3, 0))
+
+                -- Attack
+                killAuraAttack(entry)
+
+                task.wait(0.15)
+                elapsed += 0.15
+            end
+
+            -- Collect loot after kill
+            if Flags.AutoCollect then
+                task.wait(0.2)
+                collectAllDrops()
+            end
+
+            task.wait(0.1)
         end
     end)
 end
@@ -803,12 +839,13 @@ CombatTab:CreateToggle({
 })
 
 CombatTab:CreateSlider({
-    Name      = "Farm Radius  (gate lock)",
-    Range     = {50, 2000},
-    Increment = 50,
-    Suffix    = " studs",
-    Default   = 500,
-    Callback  = function(val)
+    Name         = "Farm Radius  (gate lock)",
+    Range        = {50, 2000},
+    Increment    = 50,
+    Suffix       = " studs",
+    CurrentValue = 500,
+    Flag         = "FarmRadius",
+    Callback     = function(val)
         Config.FarmRadius = val
     end,
 })
@@ -824,12 +861,13 @@ CombatTab:CreateToggle({
 })
 
 CombatTab:CreateSlider({
-    Name      = "Kill Aura Radius",
-    Range     = {10, 500},
-    Increment = 5,
-    Suffix    = " studs",
-    Default   = 50,
-    Callback  = function(val)
+    Name         = "Kill Aura Radius",
+    Range        = {10, 500},
+    Increment    = 5,
+    Suffix       = " studs",
+    CurrentValue = 50,
+    Flag         = "KillAuraRadius",
+    Callback     = function(val)
         Config.KillAuraRadius = val
     end,
 })
@@ -899,24 +937,26 @@ PlayerTab:CreateButton({
 PlayerTab:CreateSection("Movement")
 
 PlayerTab:CreateSlider({
-    Name      = "Walk Speed",
-    Range     = {16, 500},
-    Increment = 1,
-    Suffix    = "",
-    Default   = 16,
-    Callback  = function(val)
+    Name         = "Walk Speed",
+    Range        = {16, 500},
+    Increment    = 1,
+    Suffix       = "",
+    CurrentValue = 16,
+    Flag         = "WalkSpeed",
+    Callback     = function(val)
         Config.WalkSpeed = val
         if Hum then Hum.WalkSpeed = val end
     end,
 })
 
 PlayerTab:CreateSlider({
-    Name      = "Jump Power",
-    Range     = {7, 300},
-    Increment = 1,
-    Suffix    = "",
-    Default   = 50,
-    Callback  = function(val)
+    Name         = "Jump Power",
+    Range        = {7, 300},
+    Increment    = 1,
+    Suffix       = "",
+    CurrentValue = 50,
+    Flag         = "JumpPower",
+    Callback     = function(val)
         Config.JumpPower = val
         if Hum then Hum.JumpPower = val end
     end,
@@ -1150,12 +1190,13 @@ ESPTab:CreateToggle({
 })
 
 ESPTab:CreateSlider({
-    Name      = "Max ESP Distance",
-    Range     = {50, 1000},
-    Increment = 10,
-    Suffix    = " studs",
-    Default   = 300,
-    Callback  = function(val) Config.ESPMaxDist = val end,
+    Name         = "Max ESP Distance",
+    Range        = {50, 1000},
+    Increment    = 10,
+    Suffix       = " studs",
+    CurrentValue = 300,
+    Flag         = "ESPMaxDist",
+    Callback     = function(val) Config.ESPMaxDist = val end,
 })
 
 -- ═══════════════════════════════════════════════
@@ -1179,12 +1220,13 @@ MiscTab:CreateToggle({
 })
 
 MiscTab:CreateSlider({
-    Name      = "Slot Machine Delay",
-    Range     = {1, 10},
-    Increment = 0.5,
-    Suffix    = "s",
-    Default   = 2,
-    Callback  = function(val) Config.SlotMachineDelay = val end,
+    Name         = "Slot Machine Delay",
+    Range        = {1, 10},
+    Increment    = 0.5,
+    Suffix       = "s",
+    CurrentValue = 2,
+    Flag         = "SlotDelay",
+    Callback     = function(val) Config.SlotMachineDelay = val end,
 })
 
 MiscTab:CreateToggle({
