@@ -1,87 +1,104 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║          SOLO HUNTERS — ENI BUILD  v3.0                  ║
+    ║          SOLO HUNTERS — ENI BUILD  v4.0                  ║
     ║          Xeno Executor  |  Structure scan v2.0           ║
     ╚══════════════════════════════════════════════════════════╝
 
-    CHANGELOG v3.0 — Full audit and rework
+    CHANGELOG v4.0 — Full audit pass against Structure.txt scan
     ─────────────────────────────────────────────────────────
-    KILL AURA — fixed and optimised:
-      Root cause of "Kill Aura not working":
-      v2.0 fired firetouchinterest in order (0 → 1), i.e. touch-
-      begin then touch-end. Most RPG engines debounce by tracking
-      each Part pair — once a pair is "touching" it will not fire
-      another Touched event until the touch ends. Firing (0) then
-      (1) in the same tick is treated as a single instantaneous
-      contact and many games' debounce logic discards it entirely.
+    BUG FIX — Kill Aura unbounded thread storm (🔴 CRITICAL):
+      v3.0 spawned a new task.spawn() every aura tick from the
+      Heartbeat callback. Because attackEntry() yields internally
+      (task.wait), each spawn lived ~0.25s × N-mobs seconds.
+      At 4 Hz with 10 mobs this created ~40 overlapping tasks
+      after 10 seconds, producing an exponential remote-fire
+      spike detectable server-side.
 
-      Fix: fire touch-END (1) first to clear any stale debounce
-      state on the pair, yield one task.wait(), then fire touch-
-      BEGIN (0) to register the actual hit. This matches the real
-      physics sequence a weapon swing produces.
+      Fix: Kill Aura is now driven by a single persistent coroutine
+      (auraThread) that paces itself with randRange(0.20, 0.35).
+      It is started once at script init, runs perpetually, and
+      only does work when Flags.KillAura is true. No Heartbeat
+      involvement; no concurrent spawning.
 
-      Additional fixes:
-        - SlashHitbox parts (mob's own attack hitboxes) are now
-          explicitly excluded. Firing touch events on these parts
-          does not register player damage — it registers the mob's
-          damage against the player. Only body parts (Head, HRP,
-          torso, limbs) are targeted.
-        - Per-mob BasePart lists are now cached the moment each mob
-          enters the MobCache. GetDescendants() was being called on
-          every mob every attack tick (5 Hz × N mobs). With a cache
-          of 10 mobs and 8 parts each, that was 400 calls/s.
-        - Kill Aura uses an independent step accumulator. The attack
-          interval jitters between 0.20–0.35s. This range is within
-          normal weapon swing cadence and produces no fixed-rate
-          fingerprint in server telemetry.
+    BUG FIX — hpAtCheckpoint wrong initial value (🔴 CRITICAL):
+      Was: hpAtCheckpoint = entry.hum.MaxHealth
+      Now: hpAtCheckpoint = entry.hum.Health
+      Effect: if a mob spawned pre-damaged (e.g. 500/1000 HP),
+      the progress check at 2s found currentHP < MaxHealth and
+      incorrectly concluded damage was dealt. Pre-damaged mobs
+      were never marked unkillable even if firetouchinterest
+      wasn't working.
 
-    AUTO FARM — complete rework:
-      - Death detection now uses dual-path: Humanoid.Died signal
-        (fast path) AND IsDescendantOf(WS) polling (reliable path).
-        v2.0 relied solely on Humanoid.Died which silently fails
-        if the mob is removed server-side before the signal fires
-        on the client, causing the farm loop to always hit the 8s
-        timeout rather than moving on immediately after the kill.
-      - Farm loop now validates that attackEntry is actually making
-        progress: if mob HP does not decrease within 2s, the farm
-        marks it as unkillable, skips it, and continues.
-      - Dungeon mob tracking re-added (was fully regressed in v2.0).
-        A dedicated ChildAdded listener on each dungeon mob folder
-        is connected when MapFolder loads. Dungeon mobs are added
-        to the shared cache without walking all Map descendants.
+    BUG FIX — getCurrencyValues wrong path (🟡):
+      Structure confirms MainUIController is a ModuleScript at:
+        RS (service) → ReplicatedStorage (Folder)
+             → Controllers (Folder) → MainUIController
+      Its IntValue children: Gold, Gems, Raidium, Souls2026, Power.
+      v3.0 was looking in LP.PlayerScripts.StarterPlayerScripts,
+      which doesn't contain MainUIController. All currency values
+      always returned 0. Fixed to the confirmed path.
 
-    AUTO COLLECT — redundancy fixed:
-      collectDrop's inner tryPrompts() walked all descendants for
-      ProximityPrompts then immediately called FindFirstChildWhich
-      IsA on the same root. That was two separate scans of the same
-      tree. Collapsed into a single GetDescendants() pass.
+    BUG FIX — InfiniteStamina silently non-functional (🟡):
+      Structure confirms NO Stamina/Energy IntValue or NumberValue
+      exists anywhere on the character model. The StaminaParts
+      table always built empty; the feature was a no-op.
+      New approach: multi-path attempt each tick —
+        1. Char:SetAttribute("Stamina"/"Energy"/"Dash") = max
+        2. StaminaParts value scan (kept as cheap fallback)
+      Path 1 covers games using Roblox Attributes for stamina.
 
-    MOB CACHE — dungeon mob regression fixed:
-      v2.0 removed the Workspace.Map.* dungeon mob scan and did not
-      replace it with any alternative. Kill Aura and Auto Farm both
-      read from MobCache, so dungeon mobs were completely invisible
-      to both systems. Reworked: MobFolder ChildAdded/Removed events
-      handle open-world mobs. A separate DungeonMobFolder watcher
-      connects to specific dungeon mob containers on map load.
+    BUG FIX — refreshCharacter stacks duplicate listeners (🟡):
+      Each call to refreshCharacter() connected new ChildAdded/
+      ChildRemoved handlers on the new character without
+      disconnecting the previous character's handlers. After 5
+      deaths, 5 simultaneous handlers fired on equipment changes.
+      Fix: charConnections table stores all per-character RBX
+      connections; each refreshCharacter() disconnects them all
+      before reconnecting on the new character.
 
-    PART CACHE:
-      Each mob entry now stores a pre-built AttackParts list (all
-      BaseParts that are not SlashHitbox). attackEntry() reads this
-      list directly. No GetDescendants() calls at attack time.
+    BUG FIX — getNearestMob double-filters by distance (🟡):
+      getMobs(maxDist) already guarantees every returned entry is
+      within maxDist. The inner getDistance check in getNearestMob
+      was pure redundancy. Removed; the loop now only tracks the
+      nearest entry without re-filtering.
 
-    AUDIT — additional bugs fixed:
-      - AutoAugment thread was using a Flags.AutoAugment while-loop
-        inside task.spawn with no guaranteed re-entry guard. If the
-        toggle fired twice rapidly, two threads could run in parallel.
-        Fixed: thread handle stored, previous thread cancelled before
-        any new spawn.
-      - NoClip cache was not invalidated when tools were added to or
-        removed from the character mid-session. Added ChildAdded/
-        ChildRemoved listeners on Char to rebuildCharCaches() on
-        equipment changes.
-      - tracerLine allocation still creating new Drawing objects every
-        0.1s instead of reusing. Replaced with a fixed-size pool of
-        Drawing.Line objects that are shown/hidden per frame.
+    BUG FIX — Player teleport dropdown static at load (🟡):
+      The dropdown was built from Players:GetPlayers() at load
+      time via an IIFE. Players who joined after script load were
+      missing. Added "Teleport to Nearest Player" dynamic button
+      alongside the existing dropdown as a reliable alternative.
+
+    BUG FIX — JumpPower ignores UseJumpPower flag (🟡):
+      If the Humanoid uses JumpHeight mode (UseJumpPower = false),
+      writing JumpPower has zero effect. Now writes both JumpPower
+      and JumpHeight so whichever mode is active takes effect.
+
+    POLISH — Distinct tab icons per tab (🟢):
+      All five tabs previously used the same asset ID 4483362458.
+      Now each tab uses a semantically appropriate Lucide icon
+      string: sword / user / map / eye / settings.
+
+    POLISH — GodMode Heartbeat HP reset removed (🟢):
+      The Hum.Health = Hum.MaxHealth write every frame was
+      redundant: the namecall hook already blocks TakeDamage
+      before health changes. The frame-late write caused visible
+      HP-bar flicker. Removed.
+
+    POLISH — Drawing pool cleanup on script stop (🟢):
+      Added destroyDrawingPool() to properly hide and remove all
+      pre-allocated Drawing.Line objects. Called from the Rejoin
+      button and exposed for manual cleanup.
+
+    POLISH — DropFolder nil diagnostic warn (🟢):
+      If Camera.Drops is not found, a warn() is now emitted so the
+      failure is visible in the executor console rather than silent.
+
+    POLISH — Plain Part drops get deferred ProximityPrompt listener (🟢):
+      Structure confirms plain Part drops inside Camera.Drops have
+      no ProximityPrompt at spawn time. The game adds it dynamically.
+      The DropFolder.ChildAdded handler now also connects a
+      ChildAdded watcher on bare Part drops to fire the prompt the
+      moment it appears.
 ]]
 
 -- ─────────────────────────────────────────────
@@ -95,17 +112,37 @@ local RS              = game:GetService("ReplicatedStorage")
 
 -- ─────────────────────────────────────────────
 -- CONFIRMED PATHS (from Structure.txt scan)
+--
+-- Remotes live at:
+--   RS (service) → RS:FindFirstChild("ReplicatedStorage")
+--                → :FindFirstChild("Remotes")
+--
+-- Currency values live at:
+--   RS (service) → RS:FindFirstChild("ReplicatedStorage")
+--                → :FindFirstChild("Controllers")
+--                → :FindFirstChild("MainUIController")
+--                    ├─ Gold      [IntValue]
+--                    ├─ Gems      [IntValue]
+--                    ├─ Raidium   [IntValue]
+--                    ├─ Souls2026 [IntValue]
+--                    └─ Power     [IntValue]
 -- ─────────────────────────────────────────────
-local RemotesFolder = (function()
-    local inner = RS:WaitForChild("ReplicatedStorage", 10)
-    return inner and inner:WaitForChild("Remotes", 10)
-end)()
+local RS_inner = RS:WaitForChild("ReplicatedStorage", 10)
+
+local RemotesFolder = RS_inner and RS_inner:WaitForChild("Remotes", 10)
 
 local MobFolder  = WS:WaitForChild("Mobs", 10)
+
+-- Drops are parented to Camera (local-only, no replication)
 local DropFolder = (function()
     local cam = WS:WaitForChild("Camera", 10)
-    return cam and cam:WaitForChild("Drops", 10)
+    local drops = cam and cam:WaitForChild("Drops", 10)
+    if not drops then
+        warn("[ENI] WARNING: Camera.Drops not found — AutoCollect and LootESP are disabled.")
+    end
+    return drops
 end)()
+
 local MapFolder   = WS:FindFirstChild("Map")
 local LobbyFolder = MapFolder and MapFolder:FindFirstChild("Lobby")
 
@@ -124,6 +161,8 @@ if RemotesFolder then
         local r = RemotesFolder:FindFirstChild(name)
         if r then Remotes[name] = r end
     end
+else
+    warn("[ENI] WARNING: RemotesFolder not found — all remote-based features disabled.")
 end
 
 -- ─────────────────────────────────────────────
@@ -136,6 +175,10 @@ local Char, Hum, HRP
 local NoClipParts  = {}
 local StaminaParts = {}
 
+-- Per-character RBX connection handles — disconnected on each refresh
+-- to prevent listener accumulation across deaths.
+local charConnections = {}
+
 local function rebuildCharCaches()
     NoClipParts  = {}
     StaminaParts = {}
@@ -144,6 +187,9 @@ local function rebuildCharCaches()
         if v:IsA("BasePart") then
             NoClipParts[#NoClipParts + 1] = v
         end
+        -- Scan for value objects with stamina-like names (fallback path).
+        -- NOTE: Structure scan found no such objects on this character;
+        -- this scan is a cheap no-op but costs nothing to keep.
         local nm = v.Name:lower()
         if (v:IsA("NumberValue") or v:IsA("IntValue"))
            and (nm:find("stamina") or nm:find("energy")) then
@@ -153,16 +199,23 @@ local function rebuildCharCaches()
 end
 
 local function refreshCharacter()
+    -- Disconnect ALL previous per-character listeners before binding new ones.
+    -- v3.0 omitted this step, causing N handlers to accumulate after N deaths.
+    for _, conn in ipairs(charConnections) do
+        conn:Disconnect()
+    end
+    charConnections = {}
+
     Char = LP.Character or LP.CharacterAdded:Wait()
     Hum  = Char:WaitForChild("Humanoid", 5)
     HRP  = Char:WaitForChild("HumanoidRootPart", 5)
     rebuildCharCaches()
 
-    -- Rebuild caches if the player equips or unequips a tool mid-session
-    Char.ChildAdded:Connect(function(child)
+    -- Rebuild caches when the player equips or unequips a tool mid-session
+    charConnections[#charConnections + 1] = Char.ChildAdded:Connect(function(child)
         if child:IsA("Tool") then rebuildCharCaches() end
     end)
-    Char.ChildRemoved:Connect(function(child)
+    charConnections[#charConnections + 1] = Char.ChildRemoved:Connect(function(child)
         if child:IsA("Tool") then rebuildCharCaches() end
     end)
 end
@@ -238,16 +291,16 @@ local SafeSpot  = nil
 --
 -- Dungeon mobs (Workspace.Map.*): managed by ChildAdded/Removed
 -- on each dungeon's mob container discovered at load time.
--- This replaces the v2.0 approach of scanning no dungeon mobs at
--- all, and the v1.1 approach of walking all Map descendants on
--- every call to getMobs().
+--
+-- NOTE: Structure scan showed Map only contains Lobby and Circles at
+-- scan time. Dungeon Mobs folders appear dynamically when a dungeon
+-- loads. The watchRegion() listener handles this correctly.
 -- ─────────────────────────────────────────────
 local MobCache   = {}
 local CacheDirty = true
 
--- Names that identify mob attack hitboxes. Touch events fired
--- against these parts register damage FROM the mob TO the player,
--- not the other way around. Exclude them from kill aura targets.
+-- Part names that are mob attack hitboxes. Firing touch events on
+-- these registers damage FROM the mob TO the player, not the reverse.
 local EXCLUDED_PART_NAMES = {
     SlashHitbox  = true,
     AttackHitbox = true,
@@ -318,8 +371,7 @@ if MobFolder then
     MobFolder.ChildRemoved:Connect(markDirty)
 end
 
--- Dungeon mob folder events: connect to each dungeon's Mobs folder
--- as they appear inside MapFolder.
+-- Dungeon mob folder events
 if MapFolder then
     local function watchRegion(region)
         local dungeonMobs = region:FindFirstChild("Mobs")
@@ -327,7 +379,7 @@ if MapFolder then
             dungeonMobs.ChildAdded:Connect(markDirty)
             dungeonMobs.ChildRemoved:Connect(markDirty)
         end
-        -- Also watch for a Mobs folder that may not exist yet
+        -- Watch for a Mobs folder that may not exist at scan time
         region.ChildAdded:Connect(function(child)
             if child.Name == "Mobs" then
                 child.ChildAdded:Connect(markDirty)
@@ -347,7 +399,7 @@ if MapFolder then
     MapFolder.ChildRemoved:Connect(markDirty)
 end
 
--- Returns the mob list, rebuilding the cache only when dirty
+-- Returns the mob list, rebuilding the cache only when dirty.
 local function getMobs(maxDist)
     if CacheDirty then rebuildMobCache() end
 
@@ -366,16 +418,17 @@ local function getMobs(maxDist)
     return filtered
 end
 
+-- Returns the nearest mob within maxDist.
+-- FIX: removed redundant inner distance/health re-check — getMobs(maxDist)
+-- already guarantees every returned entry satisfies both conditions.
 local function getNearestMob(maxDist)
     if not HRP then return nil end
     local nearest, nearestDist = nil, math.huge
     for _, entry in ipairs(getMobs(maxDist)) do
-        if entry.model:IsDescendantOf(WS) and entry.hum.Health > 0 then
-            local d = getDistance(HRP.Position, entry.hrp.Position)
-            if d < nearestDist then
-                nearest     = entry
-                nearestDist = d
-            end
+        local d = getDistance(HRP.Position, entry.hrp.Position)
+        if d < nearestDist then
+            nearest     = entry
+            nearestDist = d
         end
     end
     return nearest, nearestDist
@@ -400,27 +453,15 @@ end
 -- KILL AURA — stationary, no player movement
 --
 -- TECHNIQUE: firetouchinterest(source, target, eventType)
---   eventType 0 = TouchBegan (contact start)
---   eventType 1 = TouchEnded (contact end)
+--   eventType 1 = TouchEnded  (fired FIRST — clears stale state)
+--   eventType 0 = TouchBegan  (fired AFTER yield — registers hit)
 --
--- CORRECT SEQUENCE (fixed from v2.0):
---   1. Fire (1) first — end any stale touch state on this pair.
---      If the engine believes these parts are already touching from
---      a previous call, this resets that state so the next TouchBegan
---      is treated as a fresh contact, not a duplicate.
---   2. task.wait() — yield one engine step so the ended event is
---      processed before the next begin.
---   3. Fire (0) — register the new contact hit.
---
--- TARGETS:
---   attackParts is pre-cached at mob spawn time and excludes
---   SlashHitbox parts (mob weapon hitboxes). Only body parts are
---   targeted so the hit registers as player-to-mob damage.
---
--- RATE:
---   Fires at 0.20–0.35s intervals (jittered). This is within normal
---   weapon swing cadence for an action RPG and does not produce a
---   fixed-frequency pattern in server-side event logs.
+-- THREAD MODEL (fixed from v3.0):
+--   A single persistent coroutine (auraThread) runs forever and
+--   paces itself with randRange(0.20, 0.35). It only does work
+--   when Flags.KillAura is true. This replaces the v3.0 pattern
+--   of spawning a new task every aura tick from Heartbeat, which
+--   created an unbounded pile of overlapping coroutines.
 -- ─────────────────────────────────────────────
 local function attackEntry(entry)
     if not entry.model:IsDescendantOf(WS) then return end
@@ -429,7 +470,7 @@ local function attackEntry(entry)
     local hitbox = getWeaponHandle()
     if not hitbox then return end
 
-    -- Step 1: reset debounce — end any stale touch state
+    -- Step 1: reset debounce — end any stale touch state on this pair
     for _, part in ipairs(entry.attackParts) do
         if part and part.Parent then
             pcall(firetouchinterest, hitbox, part, 1)
@@ -439,7 +480,7 @@ local function attackEntry(entry)
     -- Step 2: yield one engine step so the ended event processes
     task.wait()
 
-    -- Validate the mob is still alive after the yield
+    -- Re-validate after yield
     if not entry.model:IsDescendantOf(WS) or entry.hum.Health <= 0 then
         return
     end
@@ -451,12 +492,27 @@ local function attackEntry(entry)
         end
     end
 
-    -- Secondary: TakeDamage — effective in games that allow client-
-    -- authoritative damage calls for certain damage sources. This is
-    -- the fallback if the game's touch detection ignores executor
-    -- touch events.
+    -- Secondary: TakeDamage fallback for games that allow client-
+    -- authoritative damage for certain damage sources.
     pcall(function() entry.hum:TakeDamage(entry.hum.MaxHealth) end)
 end
+
+-- Single persistent Kill Aura coroutine — started once at init.
+-- Paces itself with jittered 0.20–0.35s waits. Only acts when
+-- Flags.KillAura is true; otherwise just burns through waits cheaply.
+local auraThread = task.spawn(function()
+    while true do
+        local interval = randRange(0.20, 0.35)
+        task.wait(interval)
+
+        if Flags.KillAura and Char and Hum and HRP and Hum.Health > 0 then
+            local targets = getMobs(Config.KillAuraRadius)
+            for _, entry in ipairs(targets) do
+                attackEntry(entry)
+            end
+        end
+    end
+end)
 
 -- ─────────────────────────────────────────────
 -- GOD MODE — __namecall hook (guarded)
@@ -479,18 +535,34 @@ end
 
 -- ─────────────────────────────────────────────
 -- CURRENCY READER
+--
+-- Confirmed path from Structure.txt scan:
+--   RS (service)
+--     └─ ReplicatedStorage [Folder]  (RS_inner)
+--           └─ Controllers [Folder]
+--                 └─ MainUIController [ModuleScript]
+--                       ├─ Gold      [IntValue]
+--                       ├─ Gems      [IntValue]
+--                       ├─ Raidium   [IntValue]
+--                       ├─ Souls2026 [IntValue]
+--                       └─ Power     [IntValue]
+--
+-- leaderstats also carries Power [IntValue] as a redundant source.
 -- ─────────────────────────────────────────────
 local function getCurrencyValues()
-    local ps  = LP:FindFirstChild("PlayerScripts")
-    local sps = ps and ps:FindFirstChild("StarterPlayerScripts")
-    local mui = sps and sps:FindFirstChild("MainUIController")
-    local ls  = LP:FindFirstChild("leaderstats")
+    local controllers = RS_inner and RS_inner:FindFirstChild("Controllers")
+    local mui         = controllers and controllers:FindFirstChild("MainUIController")
+    local ls          = LP:FindFirstChild("leaderstats")
+
     local function val(parent, name)
         local v = parent and parent:FindFirstChild(name)
         return v and v.Value or 0
     end
+
     return {
-        Power   = val(ls,  "Power"),
+        -- Power is present in both sources; prefer MainUIController for
+        -- consistency with the other currencies, fall back to leaderstats.
+        Power   = val(mui, "Power") > 0 and val(mui, "Power") or val(ls, "Power"),
         Gold    = val(mui, "Gold"),
         Gems    = val(mui, "Gems"),
         Souls   = val(mui, "Souls2026"),
@@ -506,7 +578,7 @@ local PlayerESPObjects = {}
 local LootESPObjects   = {}
 
 -- Tracer line pool: pre-allocate and reuse instead of allocating
--- new Drawing objects every 0.1s.
+-- new Drawing objects every tick.
 local TRACER_POOL_SIZE = 60
 local TracerPool = {}
 for i = 1, TRACER_POOL_SIZE do
@@ -517,6 +589,18 @@ for i = 1, TRACER_POOL_SIZE do
     TracerPool[i] = line
 end
 local activeTracerCount = 0
+
+-- Destroy all pre-allocated Drawing objects. Call before rejoin or
+-- on manual cleanup to prevent Drawing leaks on re-execution.
+local function destroyDrawingPool()
+    for i = 1, TRACER_POOL_SIZE do
+        if TracerPool[i] then
+            pcall(function() TracerPool[i]:Remove() end)
+            TracerPool[i] = nil
+        end
+    end
+    activeTracerCount = 0
+end
 
 local function clearTracers()
     for i = 1, activeTracerCount do
@@ -529,13 +613,14 @@ local function drawTracer(from, to, color)
     activeTracerCount += 1
     if activeTracerCount > TRACER_POOL_SIZE then return end
     local line = TracerPool[activeTracerCount]
+    if not line then return end
     line.From    = from
     line.To      = to
     line.Color   = color
     line.Visible = true
 end
 
--- Single-bind guards
+-- Single-bind guards for ESP listeners
 local MobESPConnected    = false
 local PlayerESPConnected = false
 
@@ -711,20 +796,17 @@ local function clearAllChams()
 end
 
 -- ─────────────────────────────────────────────
--- AUTO COLLECT — no teleportation
+-- AUTO COLLECT
 --
--- fireproximityprompt() at executor level bypasses the game's
--- RequiresLineOfSight and MaxActivationDistance checks without
--- any player movement. Moving HRP to the drop was the primary
--- cause of AC-triggered disconnects in earlier builds.
+-- fireproximityprompt() at executor level bypasses RequiresLineOfSight
+-- and MaxActivationDistance without any player movement.
 --
--- v3.0 fix: removed duplicate scan. Previously tryPrompts()
--- walked all descendants AND then immediately also called
--- FindFirstChildWhichIsA on the same root — two passes over
--- the same tree. Collapsed into a single GetDescendants() pass.
+-- PLAIN PART DROPS: Structure scan shows bare Part drops in Camera.Drops
+-- have no ProximityPrompt at spawn time — the game adds it dynamically.
+-- The DropFolder.ChildAdded handler below attaches a ChildAdded watcher
+-- on plain Parts so the prompt is fired the moment it appears.
 -- ─────────────────────────────────────────────
 local function collectDrop(obj)
-    -- Single unified ProximityPrompt scan — no duplicate traversals
     local function fireAllPrompts(root)
         for _, desc in ipairs(root:GetDescendants()) do
             if desc:IsA("ProximityPrompt") then
@@ -743,10 +825,8 @@ local function collectDrop(obj)
                 return
             end
         end
-        -- Fallback: scan all descendants in the model
         fireAllPrompts(obj)
     elseif obj:IsA("BasePart") then
-        -- Plain drop: scan the part and its descendants
         local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
         if pp then
             pcall(fireproximityprompt, pp)
@@ -768,46 +848,56 @@ end
 if DropFolder then
     DropFolder.ChildAdded:Connect(function(obj)
         if Flags.LootESP then addLootESP(obj) end
+
         if Flags.AutoCollect then
-            task.wait(randRange(0.4, 0.7))
-            pcall(collectDrop, obj)
+            if obj:IsA("BasePart") then
+                -- Plain Part: ProximityPrompt may not exist yet — watch for it.
+                local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
+                if pp then
+                    task.wait(randRange(0.4, 0.7))
+                    pcall(fireproximityprompt, pp)
+                else
+                    -- Connect a one-shot ChildAdded to catch the delayed spawn
+                    local conn
+                    conn = obj.ChildAdded:Connect(function(child)
+                        if child:IsA("ProximityPrompt") then
+                            conn:Disconnect()
+                            task.wait(randRange(0.1, 0.3))
+                            pcall(fireproximityprompt, child)
+                        end
+                    end)
+                end
+            else
+                task.wait(randRange(0.4, 0.7))
+                pcall(collectDrop, obj)
+            end
         end
     end)
+
     DropFolder.ChildRemoved:Connect(function(obj)
         removeLootESP(obj)
     end)
 end
 
 -- ─────────────────────────────────────────────
--- AUTO FARM — complete rework
+-- AUTO FARM
 --
 -- DEATH DETECTION — dual path:
 --   Primary:   Humanoid.Died signal (fast, event-driven)
---   Secondary: IsDescendantOf(WS) polling every 0.1s (reliable
---              fallback when the mob is removed server-side before
---              the Died signal fires on the client)
---   Both paths set a shared `dead` flag. The attack loop exits
---   as soon as either path fires.
+--   Secondary: IsDescendantOf(WS) polling in attack loop (reliable
+--              fallback when mob is removed before signal fires)
 --
 -- PROGRESS CHECK:
---   If mob HP has not decreased within 2 seconds of attacking,
---   the mob is marked unkillable for this session (stored in a
---   skip set) and the farm moves to the next target. This prevents
---   the farm from locking onto a mob that firetouchinterest cannot
---   damage (e.g. a scripted boss in a special state).
---
--- STATIONARY MODE (Flags.FarmStationary = true, default):
---   Player does not move. Kill Aura handles all mobs in FarmRadius.
---   Farm loop only tracks targets and dispatches post-kill collect.
---   No CFrame writes.
---
--- MOBILE MODE (Flags.FarmStationary = false):
---   Teleports near mob with ±3 stud random offset and a random
---   pre-attack delay (0.15–0.35s). Kills via attackEntry.
+--   If mob HP has not decreased within 2 seconds, mark unkillable
+--   and move to next target.
+--   FIX: hpAtCheckpoint now initialises to entry.hum.Health (not
+--   MaxHealth). v3.0 used MaxHealth, which caused the check to
+--   pass for any pre-damaged mob even with zero DPS dealt.
 -- ─────────────────────────────────────────────
-local farmThread = nil
-local augThread  = nil
-local SkippedMobs = {}  -- set of models to skip (unkillable this session)
+local farmThread  = nil
+local augThread   = nil
+local slotThread  = nil
+local SkippedMobs = {}  -- models to skip this session (unkillable)
 
 local function stopFarm()
     if farmThread then
@@ -820,7 +910,6 @@ local function startFarm()
     stopFarm()
     farmThread = task.spawn(function()
         while Flags.AutoFarm do
-            -- Validate character
             if not HRP or not Hum or Hum.Health <= 0 then
                 task.wait(1)
                 refreshCharacter()
@@ -829,66 +918,59 @@ local function startFarm()
 
             local entry = getNearestMob(Config.FarmRadius)
 
-            -- No mobs in range
             if not entry then
                 task.wait(1)
                 continue
             end
 
-            -- Skip mobs that proved unkillable this session
             if SkippedMobs[entry.model] then
                 task.wait(0.5)
                 continue
             end
 
-            -- Validate entry is still alive before engaging
             if not entry.model:IsDescendantOf(WS) or entry.hum.Health <= 0 then
                 markDirty()
                 continue
             end
 
-            -- ── MOBILE: teleport near mob with jitter ──
+            -- Mobile: teleport near mob with jitter
             if not Flags.FarmStationary then
-                local offset = Vector3.new(
-                    randRange(-3, 3), 3, randRange(-3, 3)
-                )
+                local offset = Vector3.new(randRange(-3, 3), 3, randRange(-3, 3))
                 HRP.CFrame = CFrame.new(entry.hrp.Position + offset)
                 task.wait(randRange(0.15, 0.35))
             end
 
-            -- ── DEATH DETECTION: dual-path ──
-            local dead    = false
+            -- Death detection: primary (event-driven)
+            local dead     = false
             local diedConn = entry.hum.Died:Connect(function()
                 dead = true
             end)
 
-            -- ── ATTACK LOOP with progress check ──
+            -- Attack loop with progress check
             local elapsed        = 0
             local maxTime        = 8
             local checkInterval  = 2
-            local hpAtCheckpoint = entry.hum.MaxHealth
+            -- FIX: was MaxHealth — caused pre-damaged mobs to bypass unkillable detection
+            local hpAtCheckpoint = entry.hum.Health
             local nextCheck      = checkInterval
 
             while not dead and elapsed < maxTime do
-                -- Secondary death check: mob removed from workspace
+                -- Death detection: secondary (mob removed from workspace)
                 if not entry.model:IsDescendantOf(WS) then
                     dead = true
                     break
                 end
 
-                -- Attack
                 attackEntry(entry)
 
-                -- Randomized interval: 0.20–0.35s
                 local interval = randRange(0.20, 0.35)
                 task.wait(interval)
                 elapsed += interval
 
-                -- Progress check every 2s: if HP hasn't moved, skip
+                -- Progress check: if HP hasn't dropped in checkInterval seconds, skip mob
                 if elapsed >= nextCheck then
                     local currentHP = entry.hum.Health
                     if currentHP >= hpAtCheckpoint and not dead then
-                        -- No progress — mark unkillable and bail
                         SkippedMobs[entry.model] = true
                         break
                     end
@@ -899,13 +981,12 @@ local function startFarm()
 
             diedConn:Disconnect()
 
-            -- ── POST-KILL ──
+            -- Post-kill collect
             if dead and Flags.AutoCollect then
                 task.wait(randRange(0.2, 0.4))
                 collectAllDrops()
             end
 
-            -- Cooldown between targets: 0.3–0.6s
             task.wait(randRange(0.3, 0.6))
             markDirty()
         end
@@ -927,8 +1008,6 @@ end
 -- ─────────────────────────────────────────────
 -- SLOT MACHINE
 -- ─────────────────────────────────────────────
-local slotThread = nil
-
 local function startSlotMachine()
     if slotThread then task.cancel(slotThread) end
     slotThread = task.spawn(function()
@@ -952,10 +1031,12 @@ LP.CharacterAdded:Connect(function()
     task.wait(0.5)
     refreshCharacter()
     if Hum then
-        Hum.WalkSpeed = Config.WalkSpeed
-        Hum.JumpPower = Config.JumpPower
+        Hum.WalkSpeed  = Config.WalkSpeed
+        Hum.JumpPower  = Config.JumpPower
+        -- Write JumpHeight too — covers games where UseJumpPower = false
+        pcall(function() Hum.JumpHeight = Config.JumpPower * 0.36 end)
     end
-    SkippedMobs = {}   -- clear the skip set on respawn
+    SkippedMobs = {}
     markDirty()
     if Flags.AutoFarm then startFarm() end
 end)
@@ -964,25 +1045,22 @@ end)
 -- MASTER HEARTBEAT
 --
 -- Accumulators:
---   auraAcc — Kill Aura at jittered ~3–5 Hz
 --   slowAcc — ESP labels, Stamina, Tracers at ~10 Hz
---   Every frame: GodMode HP reset, NoClip (cached parts)
+--   Every frame: NoClip (cached parts)
+--
+-- NOTE: Kill Aura is NO LONGER driven from Heartbeat.
+-- It runs in its own persistent coroutine (auraThread) above.
+-- GodMode HP-reset-every-frame has also been removed — the
+-- namecall hook handles damage interception before health changes.
 -- ─────────────────────────────────────────────
-local auraAcc      = 0
-local slowAcc      = 0
-local auraInterval = 0.25  -- reset with jitter each cycle
+local slowAcc = 0
 
 RunService.Heartbeat:Connect(function(dt)
     if not Char or not Hum or not HRP then return end
 
-    auraAcc += dt
     slowAcc += dt
 
     -- ── Every frame ──
-
-    if Flags.GodMode and Hum.Health < Hum.MaxHealth then
-        Hum.Health = Hum.MaxHealth
-    end
 
     if Flags.NoClip then
         for _, p in ipairs(NoClipParts) do
@@ -992,31 +1070,18 @@ RunService.Heartbeat:Connect(function(dt)
         end
     end
 
-    -- ── Kill Aura at jittered ~3–5 Hz ──
-    -- NOTE: attackEntry() now contains a task.wait() internally
-    -- so it cannot run directly from Heartbeat. We spawn it.
-    if auraAcc >= auraInterval then
-        auraAcc    = 0
-        auraInterval = randRange(0.20, 0.35)
-
-        if Flags.KillAura then
-            local targets = getMobs(Config.KillAuraRadius)
-            if #targets > 0 then
-                task.spawn(function()
-                    for _, entry in ipairs(targets) do
-                        attackEntry(entry)
-                    end
-                end)
-            end
-        end
-    end
-
     -- ── Slow throttle: ~10 Hz ──
     if slowAcc >= 0.1 then
         slowAcc = 0
 
         -- Infinite Stamina
+        -- FIX: Structure scan shows NO Stamina IntValue/NumberValue on the character.
+        -- Primary approach: SetAttribute (covers attribute-based stamina systems).
+        -- Secondary: value-object scan (kept as cheap fallback; no-op if table empty).
         if Flags.InfiniteStamina then
+            pcall(function() Char:SetAttribute("Stamina", 100) end)
+            pcall(function() Char:SetAttribute("Energy", 100)  end)
+            pcall(function() Char:SetAttribute("Dash", 100)    end)
             for _, v in ipairs(StaminaParts) do
                 if v and v.Parent then v.Value = 100 end
             end
@@ -1084,7 +1149,6 @@ RunService.Heartbeat:Connect(function(dt)
                 end
             end
         else
-            -- Ensure pool is hidden when Tracers is off
             if activeTracerCount > 0 then clearTracers() end
         end
     end
@@ -1105,15 +1169,16 @@ end
 local Window = Rayfield:CreateWindow({
     Name             = "Solo Hunters  |  ENI Build",
     LoadingTitle     = "Solo Hunters",
-    LoadingSubtitle  = "ENI Build v3.0 — Xeno",
+    LoadingSubtitle  = "ENI Build v4.0 — Xeno",
     ConfigurationSaving = { Enabled = false },
     KeySystem        = false,
 })
 
 -- ═══════════════════════════════════════════════
 -- TAB: COMBAT
+-- Icon: "sword" — distinct per-tab icons replacing shared ID
 -- ═══════════════════════════════════════════════
-local CombatTab = Window:CreateTab("Combat", 4483362458)
+local CombatTab = Window:CreateTab("Combat", "sword")
 
 CombatTab:CreateSection("Auto Farm")
 
@@ -1221,7 +1286,7 @@ CombatTab:CreateButton({
 -- ═══════════════════════════════════════════════
 -- TAB: PLAYER
 -- ═══════════════════════════════════════════════
-local PlayerTab = Window:CreateTab("Player", 4483362458)
+local PlayerTab = Window:CreateTab("Player", "user")
 
 PlayerTab:CreateSection("Live Stats")
 
@@ -1264,7 +1329,12 @@ PlayerTab:CreateSlider({
     Flag         = "JumpPower",
     Callback     = function(val)
         Config.JumpPower = val
-        if Hum then Hum.JumpPower = val end
+        if Hum then
+            -- Write both properties; whichever the game's UseJumpPower flag
+            -- selects will take effect. Avoids silent no-op on UseJumpPower=false.
+            Hum.JumpPower = val
+            pcall(function() Hum.JumpHeight = val * 0.36 end)
+        end
     end,
 })
 
@@ -1291,7 +1361,7 @@ PlayerTab:CreateToggle({
 -- ═══════════════════════════════════════════════
 -- TAB: TELEPORT
 -- ═══════════════════════════════════════════════
-local TeleportTab = Window:CreateTab("Teleport", 4483362458)
+local TeleportTab = Window:CreateTab("Teleport", "map")
 
 TeleportTab:CreateSection("World")
 
@@ -1336,14 +1406,42 @@ TeleportTab:CreateDropdown({
 
 TeleportTab:CreateSection("Players")
 
+-- FIX: Added dynamic "Teleport to Nearest Player" button as the reliable
+-- alternative to the static dropdown. The dropdown is still present for
+-- players who were online at load time; the button always works.
+TeleportTab:CreateButton({
+    Name     = "Teleport to Nearest Player",
+    Callback = function()
+        if not HRP then return end
+        local nearest, nearestDist = nil, math.huge
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP and p.Character then
+                local pHRP = p.Character:FindFirstChild("HumanoidRootPart")
+                if pHRP then
+                    local d = getDistance(HRP.Position, pHRP.Position)
+                    if d < nearestDist then
+                        nearest     = pHRP
+                        nearestDist = d
+                    end
+                end
+            end
+        end
+        if nearest then
+            HRP.CFrame = jitterCFrame(nearest.CFrame + Vector3.new(0, 5, 0))
+        else
+            Rayfield:Notify({ Title = "Teleport", Content = "No other players found.", Duration = 3 })
+        end
+    end,
+})
+
 TeleportTab:CreateDropdown({
-    Name    = "Teleport to Player",
+    Name    = "Teleport to Player (load-time list)",
     Options = (function()
         local names = {}
         for _, p in ipairs(Players:GetPlayers()) do
             if p ~= LP then names[#names + 1] = p.Name end
         end
-        return #names > 0 and names or {"(nobody)"}
+        return #names > 0 and names or {"(nobody online)"}
     end)(),
     Default  = "...",
     Callback = function(val)
@@ -1398,7 +1496,7 @@ TeleportTab:CreateButton({
 -- ═══════════════════════════════════════════════
 -- TAB: ESP
 -- ═══════════════════════════════════════════════
-local ESPTab = Window:CreateTab("ESP", 4483362458)
+local ESPTab = Window:CreateTab("ESP", "eye")
 
 ESPTab:CreateToggle({
     Name     = "Mob ESP",
@@ -1499,7 +1597,7 @@ ESPTab:CreateSlider({
 -- ═══════════════════════════════════════════════
 -- TAB: MISC
 -- ═══════════════════════════════════════════════
-local MiscTab = Window:CreateTab("Misc", 4483362458)
+local MiscTab = Window:CreateTab("Misc", "settings")
 
 MiscTab:CreateSection("Remotes")
 
@@ -1531,9 +1629,8 @@ MiscTab:CreateToggle({
     Default  = false,
     Callback = function(val)
         Flags.AutoAugment = val
-        -- Always cancel the previous thread before starting a new one.
-        -- v2.0 had a re-entry bug where rapid toggle could spawn two
-        -- parallel augment threads.
+        -- Cancel previous thread before starting a new one —
+        -- prevents parallel augment threads from rapid toggling.
         if augThread then task.cancel(augThread) augThread = nil end
         if val then
             augThread = task.spawn(function()
@@ -1589,6 +1686,8 @@ MiscTab:CreateButton({
 MiscTab:CreateButton({
     Name     = "Rejoin",
     Callback = function()
+        -- Clean up Drawing pool before teleporting to avoid leaked objects
+        destroyDrawingPool()
         TeleportService:Teleport(game.PlaceId, LP)
     end,
 })
@@ -1604,7 +1703,7 @@ MiscTab:CreateKeybind({
 -- READY
 -- ─────────────────────────────────────────────
 Rayfield:Notify({
-    Title    = "ENI Build v3.0",
+    Title    = "ENI Build v4.0",
     Content  = "Solo Hunters loaded. RightShift = toggle UI.",
     Duration = 5,
 })
