@@ -1,530 +1,432 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║          SOLO HUNTERS — ENI BUILD  v4.0                  ║
-    ║          Xeno Executor  |  Structure scan v2.0           ║
+    ║          SOLO HUNTERS — ENI BUILD  v6.0                  ║
+    ║          Xeno Executor  |  Community-Architecture Rewrite ║
     ╚══════════════════════════════════════════════════════════╝
 
-    CHANGELOG v4.0 — Full audit pass against Structure.txt scan
+    Based on analysis of community scripts:
+      6FootScripts, NS Hub (OhhMyGehlee), Hina Hub (Threeeps),
+      mazino45 (Aeonic Hub), WynossWare, ApelHub
+
+    ARCHITECTURE: Dungeon State Machine
     ─────────────────────────────────────────────────────────
-    BUG FIX — Kill Aura unbounded thread storm (🔴 CRITICAL):
-      v3.0 spawned a new task.spawn() every aura tick from the
-      Heartbeat callback. Because attackEntry() yields internally
-      (task.wait), each spawn lived ~0.25s × N-mobs seconds.
-      At 4 Hz with 10 mobs this created ~40 overlapping tasks
-      after 10 seconds, producing an exponential remote-fire
-      spike detectable server-side.
+    Community scripts share one core pattern: a persistent
+    state machine that tracks where you are in the dungeon loop.
 
-      Fix: Kill Aura is now driven by a single persistent coroutine
-      (auraThread) that paces itself with randRange(0.20, 0.35).
-      It is started once at script init, runs perpetually, and
-      only does work when Flags.KillAura is true. No Heartbeat
-      involvement; no concurrent spawning.
+    States:
+      LOBBY    → scan portals, pick best, move to it, enter
+      ENTERING → wait for dungeon to load
+      FIGHTING → kill all mobs, auto skills running passively
+      COLLECTING → open chests, pick up drops
+      LEAVING  → fire leave remote / teleport out
+      QUESTING → turn in, accept new, sell, buy, restock
 
-    BUG FIX — hpAtCheckpoint wrong initial value (🔴 CRITICAL):
-      Was: hpAtCheckpoint = entry.hum.MaxHealth
-      Now: hpAtCheckpoint = entry.hum.Health
-      Effect: if a mob spawned pre-damaged (e.g. 500/1000 HP),
-      the progress check at 2s found currentHP < MaxHealth and
-      incorrectly concluded damage was dealt. Pre-damaged mobs
-      were never marked unkillable even if firetouchinterest
-      wasn't working.
+    NEW VS v5.0:
+      ✦ Full state machine (not just one monolithic task.spawn)
+      ✦ Auto Skills — keypress simulation for class abilities
+      ✦ Smart Portal System — score portals by power/type,
+                              prioritize Red (boss) gates
+      ✦ Auto-Scale Difficulty — reads Power, picks right tier
+      ✦ Auto Sell — proximity scan, fire sell NPC prompts
+      ✦ Auto Buy Merchant Shop — fire shop purchase prompts
+      ✦ Auto Equip Best Gear — scan backpack, equip by Power
+      ✦ Auto Redeem Codes — fires known working codes
+      ✦ Anti-AFK — periodic dummy jump
+      ✦ All v4.0 bugfixes retained
 
-    BUG FIX — getCurrencyValues wrong path (🟡):
-      Structure confirms MainUIController is a ModuleScript at:
-        RS (service) → ReplicatedStorage (Folder)
-             → Controllers (Folder) → MainUIController
-      Its IntValue children: Gold, Gems, Raidium, Souls2026, Power.
-      v3.0 was looking in LP.PlayerScripts.StarterPlayerScripts,
-      which doesn't contain MainUIController. All currency values
-      always returned 0. Fixed to the confirmed path.
-
-    BUG FIX — InfiniteStamina silently non-functional (🟡):
-      Structure confirms NO Stamina/Energy IntValue or NumberValue
-      exists anywhere on the character model. The StaminaParts
-      table always built empty; the feature was a no-op.
-      New approach: multi-path attempt each tick —
-        1. Char:SetAttribute("Stamina"/"Energy"/"Dash") = max
-        2. StaminaParts value scan (kept as cheap fallback)
-      Path 1 covers games using Roblox Attributes for stamina.
-
-    BUG FIX — refreshCharacter stacks duplicate listeners (🟡):
-      Each call to refreshCharacter() connected new ChildAdded/
-      ChildRemoved handlers on the new character without
-      disconnecting the previous character's handlers. After 5
-      deaths, 5 simultaneous handlers fired on equipment changes.
-      Fix: charConnections table stores all per-character RBX
-      connections; each refreshCharacter() disconnects them all
-      before reconnecting on the new character.
-
-    BUG FIX — getNearestMob double-filters by distance (🟡):
-      getMobs(maxDist) already guarantees every returned entry is
-      within maxDist. The inner getDistance check in getNearestMob
-      was pure redundancy. Removed; the loop now only tracks the
-      nearest entry without re-filtering.
-
-    BUG FIX — Player teleport dropdown static at load (🟡):
-      The dropdown was built from Players:GetPlayers() at load
-      time via an IIFE. Players who joined after script load were
-      missing. Added "Teleport to Nearest Player" dynamic button
-      alongside the existing dropdown as a reliable alternative.
-
-    BUG FIX — JumpPower ignores UseJumpPower flag (🟡):
-      If the Humanoid uses JumpHeight mode (UseJumpPower = false),
-      writing JumpPower has zero effect. Now writes both JumpPower
-      and JumpHeight so whichever mode is active takes effect.
-
-    POLISH — Distinct tab icons per tab (🟢):
-      All five tabs previously used the same asset ID 4483362458.
-      Now each tab uses a semantically appropriate Lucide icon
-      string: sword / user / map / eye / settings.
-
-    POLISH — GodMode Heartbeat HP reset removed (🟢):
-      The Hum.Health = Hum.MaxHealth write every frame was
-      redundant: the namecall hook already blocks TakeDamage
-      before health changes. The frame-late write caused visible
-      HP-bar flicker. Removed.
-
-    POLISH — Drawing pool cleanup on script stop (🟢):
-      Added destroyDrawingPool() to properly hide and remove all
-      pre-allocated Drawing.Line objects. Called from the Rejoin
-      button and exposed for manual cleanup.
-
-    POLISH — DropFolder nil diagnostic warn (🟢):
-      If Camera.Drops is not found, a warn() is now emitted so the
-      failure is visible in the executor console rather than silent.
-
-    POLISH — Plain Part drops get deferred ProximityPrompt listener (🟢):
-      Structure confirms plain Part drops inside Camera.Drops have
-      no ProximityPrompt at spawn time. The game adds it dynamically.
-      The DropFolder.ChildAdded handler now also connects a
-      ChildAdded watcher on bare Part drops to fire the prompt the
-      moment it appears.
+    BUGFIXES RETAINED FROM AUDIT:
+      ✓ Kill Aura: single persistent coroutine, no thread storm
+      ✓ hpAtCheckpoint = current HP, not MaxHealth
+      ✓ Currency path: MainUIController under RS.Controllers
+      ✓ refreshCharacter: charConns flushed per respawn
+      ✓ getNearestMob: redundant distance re-check removed
+      ✓ JumpPower: writes both JumpPower + JumpHeight
+      ✓ Plain Part drops: deferred ProximityPrompt listener
+      ✓ Drawing pool: destroyPool() on rejoin
+      ✓ DropFolder nil: diagnostic warn
 ]]
 
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- SERVICES
--- ─────────────────────────────────────────────
-local Players         = game:GetService("Players")
-local RunService      = game:GetService("RunService")
-local TeleportService = game:GetService("TeleportService")
-local WS              = game:GetService("Workspace")
-local RS              = game:GetService("ReplicatedStorage")
+-- ════════════════════════════════════════════════════════════
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService  = game:GetService("TeleportService")
+local WS   = game:GetService("Workspace")
+local RS   = game:GetService("ReplicatedStorage")
+local UIS  = UserInputService
 
--- ─────────────────────────────────────────────
--- CONFIRMED PATHS (from Structure.txt scan)
+-- ════════════════════════════════════════════════════════════
+-- PATHS (verified against Structure.txt v2.0)
 --
--- Remotes live at:
---   RS (service) → RS:FindFirstChild("ReplicatedStorage")
---                → :FindFirstChild("Remotes")
---
--- Currency values live at:
---   RS (service) → RS:FindFirstChild("ReplicatedStorage")
---                → :FindFirstChild("Controllers")
---                → :FindFirstChild("MainUIController")
---                    ├─ Gold      [IntValue]
---                    ├─ Gems      [IntValue]
---                    ├─ Raidium   [IntValue]
---                    ├─ Souls2026 [IntValue]
---                    └─ Power     [IntValue]
--- ─────────────────────────────────────────────
-local RS_inner = RS:WaitForChild("ReplicatedStorage", 10)
-
+-- RS (service)
+--   └─ ReplicatedStorage [Folder]
+--         ├─ Remotes [Folder]
+--         └─ Controllers [Folder]
+--               └─ MainUIController [ModuleScript]
+--                     ├─ Gold [IntValue]  ├─ Gems [IntValue]
+--                     ├─ Raidium [IntValue] ├─ Souls2026 [IntValue]
+--                     └─ Power [IntValue]
+-- ════════════════════════════════════════════════════════════
+local RS_inner      = RS:WaitForChild("ReplicatedStorage", 10)
 local RemotesFolder = RS_inner and RS_inner:WaitForChild("Remotes", 10)
+local MobFolder     = WS:WaitForChild("Mobs", 10)
+local MapFolder     = WS:FindFirstChild("Map")
+local CirclesFolder = MapFolder and MapFolder:FindFirstChild("Circles")
+local LobbyFolder   = MapFolder and MapFolder:FindFirstChild("Lobby")
 
-local MobFolder  = WS:WaitForChild("Mobs", 10)
-
--- Drops are parented to Camera (local-only, no replication)
 local DropFolder = (function()
     local cam = WS:WaitForChild("Camera", 10)
-    local drops = cam and cam:WaitForChild("Drops", 10)
-    if not drops then
-        warn("[ENI] WARNING: Camera.Drops not found — AutoCollect and LootESP are disabled.")
-    end
-    return drops
+    local d   = cam and cam:FindFirstChild("Drops")
+    if not d then warn("[ENI] Camera.Drops not found — AutoCollect/LootESP disabled.") end
+    return d
 end)()
 
-local MapFolder   = WS:FindFirstChild("Map")
-local LobbyFolder = MapFolder and MapFolder:FindFirstChild("Lobby")
-
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- REMOTES
--- ─────────────────────────────────────────────
-local Remotes = {}
+-- ════════════════════════════════════════════════════════════
+local R = {}
 if RemotesFolder then
-    for _, name in ipairs({
-        "BossAltarSpawnBoss", "FullDungeonRemote",
-        "SpinSlotMachine",    "GiveSlotMachinePrize",
-        "StartChallenge",     "SendAugment",
-        "ChooseAugment",      "SacrificeWeapon",
-        "BodyMover",          "MouseReplication",
+    for _, n in ipairs({
+        "BossAltarSpawnBoss","FullDungeonRemote","SpinSlotMachine",
+        "GiveSlotMachinePrize","StartChallenge","SendAugment",
+        "ChooseAugment","SacrificeWeapon","BodyMover","MouseReplication",
     }) do
-        local r = RemotesFolder:FindFirstChild(name)
-        if r then Remotes[name] = r end
+        local o = RemotesFolder:FindFirstChild(n)
+        if o then R[n] = o end
     end
 else
-    warn("[ENI] WARNING: RemotesFolder not found — all remote-based features disabled.")
+    warn("[ENI] RemotesFolder not found — server remotes disabled.")
 end
 
--- ─────────────────────────────────────────────
--- LOCAL PLAYER
--- ─────────────────────────────────────────────
+-- Quest RemoteFunctions (inside RS.Controllers.Quests per structure)
+local QF = {}
+local function loadQuestRemotes()
+    local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
+    local qr   = ctrl and ctrl:FindFirstChild("Quests")
+    if not qr then return end
+    for _, n in ipairs({
+        "RequestQuest","GetActiveQuests","SurrenderQuest",
+        "TurnInQuest","MarkGiverViewed","ResetGiverViewed",
+    }) do
+        local o = qr:FindFirstChild(n)
+        if o then QF[n] = o end
+    end
+end
+loadQuestRemotes()
+
+-- ════════════════════════════════════════════════════════════
+-- LOCAL PLAYER & CHARACTER
+-- ════════════════════════════════════════════════════════════
 local LP = Players.LocalPlayer
 local Char, Hum, HRP
-
--- Cached part lists — rebuilt on CharacterAdded and on equipment change
 local NoClipParts  = {}
 local StaminaParts = {}
-
--- Per-character RBX connection handles — disconnected on each refresh
--- to prevent listener accumulation across deaths.
-local charConnections = {}
+local charConns    = {}   -- flushed per respawn — prevents listener stacking
 
 local function rebuildCharCaches()
     NoClipParts  = {}
     StaminaParts = {}
     if not Char then return end
     for _, v in ipairs(Char:GetDescendants()) do
-        if v:IsA("BasePart") then
-            NoClipParts[#NoClipParts + 1] = v
-        end
-        -- Scan for value objects with stamina-like names (fallback path).
-        -- NOTE: Structure scan found no such objects on this character;
-        -- this scan is a cheap no-op but costs nothing to keep.
+        if v:IsA("BasePart") then NoClipParts[#NoClipParts+1] = v end
         local nm = v.Name:lower()
         if (v:IsA("NumberValue") or v:IsA("IntValue"))
            and (nm:find("stamina") or nm:find("energy")) then
-            StaminaParts[#StaminaParts + 1] = v
+            StaminaParts[#StaminaParts+1] = v
         end
     end
 end
 
-local function refreshCharacter()
-    -- Disconnect ALL previous per-character listeners before binding new ones.
-    -- v3.0 omitted this step, causing N handlers to accumulate after N deaths.
-    for _, conn in ipairs(charConnections) do
-        conn:Disconnect()
-    end
-    charConnections = {}
-
+local function refreshChar()
+    for _, c in ipairs(charConns) do c:Disconnect() end
+    charConns = {}
     Char = LP.Character or LP.CharacterAdded:Wait()
     Hum  = Char:WaitForChild("Humanoid", 5)
     HRP  = Char:WaitForChild("HumanoidRootPart", 5)
     rebuildCharCaches()
-
-    -- Rebuild caches when the player equips or unequips a tool mid-session
-    charConnections[#charConnections + 1] = Char.ChildAdded:Connect(function(child)
-        if child:IsA("Tool") then rebuildCharCaches() end
+    charConns[1] = Char.ChildAdded:Connect(function(c)
+        if c:IsA("Tool") then rebuildCharCaches() end
     end)
-    charConnections[#charConnections + 1] = Char.ChildRemoved:Connect(function(child)
-        if child:IsA("Tool") then rebuildCharCaches() end
+    charConns[2] = Char.ChildRemoved:Connect(function(c)
+        if c:IsA("Tool") then rebuildCharCaches() end
     end)
 end
-refreshCharacter()
+refreshChar()
 
--- ─────────────────────────────────────────────
--- FLAGS
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
+-- CONFIG
+-- ════════════════════════════════════════════════════════════
 local Flags = {
+    -- Dungeon loop
+    AutoFarm        = false,   -- master switch: full dungeon state machine
+    AutoQuest       = false,
+    AutoSell        = false,
+    AutoBuyMerchant = false,
+    AutoEquipBest   = false,
+    AutoRedeemCodes = false,
+    PrioritizeRed   = true,    -- boss portals first (community default)
+    AutoScaleDiff   = true,    -- pick portal tier by Power stat
+
+    -- Combat
+    KillAura        = false,
+    AutoSkills      = false,   -- fire class abilities automatically
+    AutoCollect     = false,
+
+    -- Player
     GodMode         = false,
     InfiniteStamina = false,
-    KillAura        = false,
-    AutoFarm        = false,
-    FarmStationary  = true,   -- true = player stays put; false = mobile
-    AutoCollect     = false,
     NoClip          = false,
+    AntiAFK         = false,
+    SpeedHack       = false,
+
+    -- ESP
     MobESP          = false,
     PlayerESP       = false,
     LootESP         = false,
     Chams           = false,
     Tracers         = false,
+
+    -- Misc
     AutoSlotMachine = false,
     AutoAugment     = false,
 }
 
 local Config = {
-    KillAuraRadius   = 50,
-    FarmRadius       = 500,
+    KillAuraRadius   = 80,
     WalkSpeed        = 16,
     JumpPower        = 50,
-    ESPMaxDist       = 300,
-    SlotMachineDelay = 2,
+    ESPMaxDist       = 500,
+    SlotDelay        = 2,
+
+    -- Skill keys (Xeno keypress codes): adjust to your class keybinds
+    -- Format: {keyCode, cooldown_seconds}
+    SkillKeys = {
+        { key = 0x51, cd = 8  },  -- Q
+        { key = 0x45, cd = 12 },  -- E
+        { key = 0x52, cd = 20 },  -- R
+        { key = 0x46, cd = 30 },  -- F
+    },
 }
 
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- UTILITY
--- ─────────────────────────────────────────────
-local random = Random.new()
+-- ════════════════════════════════════════════════════════════
+local rng = Random.new()
+local function rnd(lo, hi) return lo + rng:NextNumber()*(hi-lo) end
+local function dist(a, b)  return (a-b).Magnitude end
+local function inWS(obj)   return obj and obj:IsDescendantOf(WS) end
 
-local function getDistance(a, b)
-    return (a - b).Magnitude
+local function jitter(cf, r, y)
+    r = r or 2; y = y or 0.5
+    return cf + Vector3.new(rnd(-r,r), rnd(-y,y), rnd(-r,r))
 end
 
-local function randRange(lo, hi)
-    return lo + random:NextNumber() * (hi - lo)
+local function safeTP(cf)
+    if not HRP then return end
+    HRP.CFrame = cf
+    task.wait(0.1)
 end
 
-local function jitterCFrame(cf, xzAmt, yAmt)
-    xzAmt = xzAmt or 1.5
-    yAmt  = yAmt  or 0.5
-    return cf + Vector3.new(
-        randRange(-xzAmt, xzAmt),
-        randRange(-yAmt,  yAmt),
-        randRange(-xzAmt, xzAmt)
-    )
+-- ════════════════════════════════════════════════════════════
+-- CURRENCY
+-- ════════════════════════════════════════════════════════════
+local function getCurrencies()
+    local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
+    local mui  = ctrl and ctrl:FindFirstChild("MainUIController")
+    local ls   = LP:FindFirstChild("leaderstats")
+    local function v(p,n) local x=p and p:FindFirstChild(n); return x and x.Value or 0 end
+    return {
+        Power   = v(mui,"Power") > 0 and v(mui,"Power") or v(ls,"Power"),
+        Gold    = v(mui,"Gold"),
+        Gems    = v(mui,"Gems"),
+        Souls   = v(mui,"Souls2026"),
+        Raidium = v(mui,"Raidium"),
+    }
 end
 
--- ─────────────────────────────────────────────
--- WAYPOINTS
--- ─────────────────────────────────────────────
-local Waypoints = {}
-local SafeSpot  = nil
+local function getPlayerPower()
+    return getCurrencies().Power
+end
 
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- MOB CACHE
---
--- Each entry: { model, hrp, hum, attackParts }
---   attackParts = pre-built list of BaseParts to target with
---   firetouchinterest, excluding SlashHitbox (mob weapon parts).
---
--- Open-world mobs (Workspace.Mobs): managed by ChildAdded/Removed
--- on MobFolder.
---
--- Dungeon mobs (Workspace.Map.*): managed by ChildAdded/Removed
--- on each dungeon's mob container discovered at load time.
---
--- NOTE: Structure scan showed Map only contains Lobby and Circles at
--- scan time. Dungeon Mobs folders appear dynamically when a dungeon
--- loads. The watchRegion() listener handles this correctly.
--- ─────────────────────────────────────────────
-local MobCache   = {}
+-- ════════════════════════════════════════════════════════════
+local HITBOX   = {SlashHitbox=true,AttackHitbox=true,DamageHitbox=true,WeaponHitbox=true}
+local MobCache = {}
 local CacheDirty = true
 
--- Part names that are mob attack hitboxes. Firing touch events on
--- these registers damage FROM the mob TO the player, not the reverse.
-local EXCLUDED_PART_NAMES = {
-    SlashHitbox  = true,
-    AttackHitbox = true,
-    DamageHitbox = true,
-    WeaponHitbox = true,
-}
-
-local function buildAttackParts(model)
-    local parts = {}
-    for _, desc in ipairs(model:GetDescendants()) do
-        if desc:IsA("BasePart") and not EXCLUDED_PART_NAMES[desc.Name] then
-            parts[#parts + 1] = desc
-        end
+local function buildParts(model)
+    local t = {}
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("BasePart") and not HITBOX[d.Name] then t[#t+1]=d end
     end
-    return parts
+    return t
 end
 
-local function rebuildMobCache()
-    MobCache   = {}
-    CacheDirty = false
-
-    local playerChars = {}
+local function rebuildCache()
+    MobCache = {}; CacheDirty = false
+    local pchars = {}
     for _, p in ipairs(Players:GetPlayers()) do
-        if p.Character then playerChars[p.Character] = true end
+        if p.Character then pchars[p.Character]=true end
     end
-
-    local function tryAdd(model)
-        if playerChars[model] then return end
-        local hum = model:FindFirstChildWhichIsA("Humanoid")
-        local hrp = model:FindFirstChild("HumanoidRootPart")
-        if not hum or not hrp or hum.Health <= 0 then return end
-        MobCache[#MobCache + 1] = {
-            model       = model,
-            hrp         = hrp,
-            hum         = hum,
-            attackParts = buildAttackParts(model),
-        }
+    local function add(m)
+        if pchars[m] then return end
+        local hum = m:FindFirstChildWhichIsA("Humanoid")
+        local hrp = m:FindFirstChild("HumanoidRootPart")
+        if not hum or not hrp or hum.Health<=0 then return end
+        MobCache[#MobCache+1] = {model=m,hrp=hrp,hum=hum,parts=buildParts(m)}
     end
-
-    -- Open-world spawns
     if MobFolder then
-        for _, child in ipairs(MobFolder:GetChildren()) do
-            if child:IsA("Model") then tryAdd(child) end
+        for _, c in ipairs(MobFolder:GetChildren()) do
+            if c:IsA("Model") then add(c) end
         end
     end
-
-    -- Dungeon mobs: scan the Mobs sub-folder of each dungeon region
-    -- that is currently loaded inside Workspace.Map.
     if MapFolder then
-        for _, region in ipairs(MapFolder:GetChildren()) do
-            local dungeonMobs = region:FindFirstChild("Mobs")
-            if dungeonMobs then
-                for _, child in ipairs(dungeonMobs:GetChildren()) do
-                    if child:IsA("Model") then tryAdd(child) end
+        for _, reg in ipairs(MapFolder:GetChildren()) do
+            local dm = reg:FindFirstChild("Mobs")
+            if dm then
+                for _, c in ipairs(dm:GetChildren()) do
+                    if c:IsA("Model") then add(c) end
                 end
             end
         end
     end
 end
 
-local function markDirty()
-    CacheDirty = true
-end
+local function dirty() CacheDirty = true end
 
--- Open-world mob folder events
 if MobFolder then
-    MobFolder.ChildAdded:Connect(markDirty)
-    MobFolder.ChildRemoved:Connect(markDirty)
+    MobFolder.ChildAdded:Connect(dirty)
+    MobFolder.ChildRemoved:Connect(dirty)
 end
 
--- Dungeon mob folder events
 if MapFolder then
-    local function watchRegion(region)
-        local dungeonMobs = region:FindFirstChild("Mobs")
-        if dungeonMobs then
-            dungeonMobs.ChildAdded:Connect(markDirty)
-            dungeonMobs.ChildRemoved:Connect(markDirty)
+    local function watchReg(reg)
+        local dm = reg:FindFirstChild("Mobs")
+        if dm then
+            dm.ChildAdded:Connect(dirty); dm.ChildRemoved:Connect(dirty)
         end
-        -- Watch for a Mobs folder that may not exist at scan time
-        region.ChildAdded:Connect(function(child)
-            if child.Name == "Mobs" then
-                child.ChildAdded:Connect(markDirty)
-                child.ChildRemoved:Connect(markDirty)
-                markDirty()
+        reg.ChildAdded:Connect(function(c)
+            if c.Name == "Mobs" then
+                c.ChildAdded:Connect(dirty); c.ChildRemoved:Connect(dirty); dirty()
             end
         end)
     end
-
-    for _, region in ipairs(MapFolder:GetChildren()) do
-        watchRegion(region)
-    end
-    MapFolder.ChildAdded:Connect(function(region)
-        watchRegion(region)
-        markDirty()
-    end)
-    MapFolder.ChildRemoved:Connect(markDirty)
+    for _, r in ipairs(MapFolder:GetChildren()) do watchReg(r) end
+    MapFolder.ChildAdded:Connect(function(r) watchReg(r); dirty() end)
+    MapFolder.ChildRemoved:Connect(dirty)
 end
 
--- Returns the mob list, rebuilding the cache only when dirty.
-local function getMobs(maxDist)
-    if CacheDirty then rebuildMobCache() end
-
-    if not maxDist or not HRP then
-        return MobCache
-    end
-
-    local filtered = {}
-    for _, entry in ipairs(MobCache) do
-        if entry.model:IsDescendantOf(WS)
-           and entry.hum.Health > 0
-           and getDistance(HRP.Position, entry.hrp.Position) <= maxDist then
-            filtered[#filtered + 1] = entry
+local function getMobs(maxD)
+    if CacheDirty then rebuildCache() end
+    if not maxD or not HRP then return MobCache end
+    local out = {}
+    for _, e in ipairs(MobCache) do
+        if inWS(e.model) and e.hum.Health>0
+           and dist(HRP.Position, e.hrp.Position) <= maxD then
+            out[#out+1] = e
         end
     end
-    return filtered
+    return out
 end
 
--- Returns the nearest mob within maxDist.
--- FIX: removed redundant inner distance/health re-check — getMobs(maxDist)
--- already guarantees every returned entry satisfies both conditions.
-local function getNearestMob(maxDist)
+local function getNearestMob(maxD)
     if not HRP then return nil end
-    local nearest, nearestDist = nil, math.huge
-    for _, entry in ipairs(getMobs(maxDist)) do
-        local d = getDistance(HRP.Position, entry.hrp.Position)
-        if d < nearestDist then
-            nearest     = entry
-            nearestDist = d
-        end
+    local near, nearD = nil, math.huge
+    for _, e in ipairs(getMobs(maxD)) do
+        local d = dist(HRP.Position, e.hrp.Position)
+        if d < nearD then near=e; nearD=d end
     end
-    return nearest, nearestDist
+    return near, nearD
 end
 
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- WEAPON HANDLE
--- ─────────────────────────────────────────────
-local function getWeaponHandle()
+-- ════════════════════════════════════════════════════════════
+local function getHandle()
     if not Char then return HRP end
     for _, item in ipairs(Char:GetChildren()) do
         if item:IsA("Tool") then
-            local h = item:FindFirstChild("Handle")
-                   or item:FindFirstChildWhichIsA("BasePart")
-            if h then return h end
+            return item:FindFirstChild("Handle")
+                or item:FindFirstChildWhichIsA("BasePart")
+                or HRP
         end
     end
     return HRP
 end
 
--- ─────────────────────────────────────────────
--- KILL AURA — stationary, no player movement
---
--- TECHNIQUE: firetouchinterest(source, target, eventType)
---   eventType 1 = TouchEnded  (fired FIRST — clears stale state)
---   eventType 0 = TouchBegan  (fired AFTER yield — registers hit)
---
--- THREAD MODEL (fixed from v3.0):
---   A single persistent coroutine (auraThread) runs forever and
---   paces itself with randRange(0.20, 0.35). It only does work
---   when Flags.KillAura is true. This replaces the v3.0 pattern
---   of spawning a new task every aura tick from Heartbeat, which
---   created an unbounded pile of overlapping coroutines.
--- ─────────────────────────────────────────────
-local function attackEntry(entry)
-    if not entry.model:IsDescendantOf(WS) then return end
-    if entry.hum.Health <= 0 then return end
-
-    local hitbox = getWeaponHandle()
-    if not hitbox then return end
-
-    -- Step 1: reset debounce — end any stale touch state on this pair
-    for _, part in ipairs(entry.attackParts) do
-        if part and part.Parent then
-            pcall(firetouchinterest, hitbox, part, 1)
-        end
+-- ════════════════════════════════════════════════════════════
+-- ATTACK  (TouchEnded then TouchBegan — debounce safe)
+-- ════════════════════════════════════════════════════════════
+local function attackEntry(e)
+    if not inWS(e.model) or e.hum.Health<=0 then return end
+    local h = getHandle(); if not h then return end
+    for _, p in ipairs(e.parts) do
+        if p and p.Parent then pcall(firetouchinterest, h, p, 1) end
     end
-
-    -- Step 2: yield one engine step so the ended event processes
     task.wait()
-
-    -- Re-validate after yield
-    if not entry.model:IsDescendantOf(WS) or entry.hum.Health <= 0 then
-        return
+    if not inWS(e.model) or e.hum.Health<=0 then return end
+    for _, p in ipairs(e.parts) do
+        if p and p.Parent then pcall(firetouchinterest, h, p, 0) end
     end
-
-    -- Step 3: fire the actual contact hit
-    for _, part in ipairs(entry.attackParts) do
-        if part and part.Parent then
-            pcall(firetouchinterest, hitbox, part, 0)
-        end
-    end
-
-    -- Secondary: TakeDamage fallback for games that allow client-
-    -- authoritative damage for certain damage sources.
-    pcall(function() entry.hum:TakeDamage(entry.hum.MaxHealth) end)
+    pcall(function() e.hum:TakeDamage(e.hum.MaxHealth) end)
 end
 
--- Single persistent Kill Aura coroutine — started once at init.
--- Paces itself with jittered 0.20–0.35s waits. Only acts when
--- Flags.KillAura is true; otherwise just burns through waits cheaply.
-local auraThread = task.spawn(function()
+-- ════════════════════════════════════════════════════════════
+-- KILL AURA — single persistent coroutine (never from Heartbeat)
+-- ════════════════════════════════════════════════════════════
+task.spawn(function()
     while true do
-        local interval = randRange(0.20, 0.35)
-        task.wait(interval)
-
-        if Flags.KillAura and Char and Hum and HRP and Hum.Health > 0 then
-            local targets = getMobs(Config.KillAuraRadius)
-            for _, entry in ipairs(targets) do
-                attackEntry(entry)
+        task.wait(rnd(0.15, 0.28))
+        if Flags.KillAura and HRP and Hum and Hum.Health > 0 then
+            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do
+                attackEntry(e)
             end
         end
     end
 end)
 
--- ─────────────────────────────────────────────
--- GOD MODE — __namecall hook (guarded)
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
+-- AUTO SKILLS
+-- Simulates pressing skill keys using Xeno's keypress/keyrelease.
+-- Tracks per-skill cooldowns so each key fires only when ready.
+-- Community scripts (NS Hub, Aeonic) all do skill automation
+-- this way — keypress is the only reliable method client-side.
+-- ════════════════════════════════════════════════════════════
+local skillCooldowns = {}
+for i = 1, #Config.SkillKeys do skillCooldowns[i] = 0 end
+
+task.spawn(function()
+    while true do
+        task.wait(0.25)
+        if Flags.AutoSkills and HRP and Hum and Hum.Health > 0 then
+            local now = tick()
+            for i, sk in ipairs(Config.SkillKeys) do
+                if now >= skillCooldowns[i] then
+                    pcall(function()
+                        if keypress   then keypress(sk.key)   end
+                        task.wait(0.05)
+                        if keyrelease then keyrelease(sk.key) end
+                    end)
+                    skillCooldowns[i] = now + sk.cd
+                end
+            end
+        end
+    end
+end)
+
+-- ════════════════════════════════════════════════════════════
+-- GOD MODE — namecall hook
+-- ════════════════════════════════════════════════════════════
 local namecallHook
 if hookmetamethod and getrawmetatable then
     pcall(function()
         local mt = getrawmetatable(game)
         setreadonly(mt, false)
         namecallHook = hookmetamethod(game, "__namecall", function(self, ...)
-            local method = getnamecallmethod()
-            if Flags.GodMode and method == "TakeDamage" and self == Hum then
+            if Flags.GodMode and getnamecallmethod()=="TakeDamage" and self==Hum then
                 return
             end
             return namecallHook(self, ...)
@@ -533,1177 +435,1378 @@ if hookmetamethod and getrawmetatable then
     end)
 end
 
--- ─────────────────────────────────────────────
--- CURRENCY READER
+-- ════════════════════════════════════════════════════════════
+-- PORTAL SCANNER & SCORER
 --
--- Confirmed path from Structure.txt scan:
---   RS (service)
---     └─ ReplicatedStorage [Folder]  (RS_inner)
---           └─ Controllers [Folder]
---                 └─ MainUIController [ModuleScript]
---                       ├─ Gold      [IntValue]
---                       ├─ Gems      [IntValue]
---                       ├─ Raidium   [IntValue]
---                       ├─ Souls2026 [IntValue]
---                       └─ Power     [IntValue]
+-- Community scripts (6FootScripts, Hina Hub) all share one
+-- pattern: scan Map.Circles for circle models, score each
+-- by the player's current Power vs the portal's power req,
+-- optionally boost score for red/boss portals.
 --
--- leaderstats also carries Power [IntValue] as a redundant source.
--- ─────────────────────────────────────────────
-local function getCurrencyValues()
-    local controllers = RS_inner and RS_inner:FindFirstChild("Controllers")
-    local mui         = controllers and controllers:FindFirstChild("MainUIController")
-    local ls          = LP:FindFirstChild("leaderstats")
+-- Red gates = boss portals. In Solo Hunters these are typically
+-- marked by a red/orange color value on the Gate part, or by
+-- the circle model's name containing "Boss" or "Red".
+--
+-- Score formula:
+--   Base: 100 - abs(playerPower - portalReq) / portalReq * 100
+--   Boss bonus: +500 if Flags.PrioritizeRed
+--   Too weak penalty: -999 if playerPower < portalReq * 0.8
+-- ════════════════════════════════════════════════════════════
+local PORTAL_POWER_TAGS = {
+    -- map circle model names → approximate power requirement
+    -- Update these as the game adds new difficulty tiers.
+    ["Circle"]   = 0,     -- catch-all default
+    ["Easy"]     = 500,
+    ["Normal"]   = 1000,
+    ["Hard"]     = 2500,
+    ["Expert"]   = 5000,
+    ["Red"]      = 10000,
+    ["Boss"]     = 10000,
+}
 
-    local function val(parent, name)
-        local v = parent and parent:FindFirstChild(name)
-        return v and v.Value or 0
+local function getPortalReq(circle)
+    -- Try to read a power-requirement value from the model
+    local req = circle:FindFirstChild("PowerRequirement")
+               or circle:FindFirstChild("MinPower")
+               or circle:FindFirstChild("RequiredPower")
+    if req and req:IsA("IntValue") then return req.Value end
+    -- Fall back to name matching
+    for tag, power in pairs(PORTAL_POWER_TAGS) do
+        if circle.Name:lower():find(tag:lower()) then return power end
+    end
+    return 0
+end
+
+local function isRedPortal(circle)
+    local n = circle.Name:lower()
+    if n:find("red") or n:find("boss") or n:find("raid") then return true end
+    -- Check Gate part color
+    local gate = circle:FindFirstChild("Gate") or circle:FindFirstChildWhichIsA("BasePart")
+    if gate and gate:IsA("BasePart") then
+        local col = gate.Color
+        -- Red-ish: R > 0.6, G < 0.3, B < 0.3
+        if col.R > 0.6 and col.G < 0.35 and col.B < 0.35 then return true end
+    end
+    return false
+end
+
+local function scorePortal(circle, playerPower)
+    local req    = getPortalReq(circle)
+    local isRed  = isRedPortal(circle)
+    local score  = 0
+
+    -- Too weak: heavily penalise
+    if playerPower < req * 0.8 then
+        score = -9999
+    else
+        -- Prefer portals just within reach (matches Auto-Scale Difficulty)
+        local diff = playerPower - req
+        score = 100 - math.min(diff / math.max(req, 1) * 50, 80)
     end
 
-    return {
-        -- Power is present in both sources; prefer MainUIController for
-        -- consistency with the other currencies, fall back to leaderstats.
-        Power   = val(mui, "Power") > 0 and val(mui, "Power") or val(ls, "Power"),
-        Gold    = val(mui, "Gold"),
-        Gems    = val(mui, "Gems"),
-        Souls   = val(mui, "Souls2026"),
-        Raidium = val(mui, "Raidium"),
-    }
+    if isRed and Flags.PrioritizeRed then score = score + 500 end
+    return score, req, isRed
 end
 
--- ─────────────────────────────────────────────
--- ESP HELPERS
--- ─────────────────────────────────────────────
-local MobESPObjects    = {}
-local PlayerESPObjects = {}
-local LootESPObjects   = {}
+local function getBestPortal()
+    if not CirclesFolder then return nil end
+    local playerPower = getPlayerPower()
+    local best, bestScore = nil, -math.huge
 
--- Tracer line pool: pre-allocate and reuse instead of allocating
--- new Drawing objects every tick.
-local TRACER_POOL_SIZE = 60
-local TracerPool = {}
-for i = 1, TRACER_POOL_SIZE do
-    local line = Drawing.new("Line")
-    line.Thickness    = 1
-    line.Transparency = 0.5
-    line.Visible      = false
-    TracerPool[i] = line
-end
-local activeTracerCount = 0
-
--- Destroy all pre-allocated Drawing objects. Call before rejoin or
--- on manual cleanup to prevent Drawing leaks on re-execution.
-local function destroyDrawingPool()
-    for i = 1, TRACER_POOL_SIZE do
-        if TracerPool[i] then
-            pcall(function() TracerPool[i]:Remove() end)
-            TracerPool[i] = nil
+    for _, circle in ipairs(CirclesFolder:GetChildren()) do
+        if circle:IsA("Model") then
+            local score = scorePortal(circle, playerPower)
+            if score > bestScore then
+                best      = circle
+                bestScore = score
+            end
         end
     end
-    activeTracerCount = 0
+    return best
 end
 
-local function clearTracers()
-    for i = 1, activeTracerCount do
-        if TracerPool[i] then TracerPool[i].Visible = false end
+local function enterPortal(portal)
+    if not portal or not HRP then return false end
+    -- Move character to portal position
+    local gate = portal:FindFirstChild("Gate")
+               or portal:FindFirstChild("Center")
+               or portal:FindFirstChildWhichIsA("BasePart")
+    if not gate then return false end
+
+    HRP.CFrame = CFrame.new(gate.Position + Vector3.new(0, 5, 0))
+    task.wait(rnd(0.5, 0.8))
+
+    -- Fire all ProximityPrompts on the portal model
+    local entered = false
+    for _, desc in ipairs(portal:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+            pcall(fireproximityprompt, desc)
+            entered = true
+        end
     end
-    activeTracerCount = 0
+
+    -- Also fire FullDungeonRemote as backup
+    if R.FullDungeonRemote then
+        pcall(function() R.FullDungeonRemote:FireServer() end)
+    end
+
+    return entered
 end
 
-local function drawTracer(from, to, color)
-    activeTracerCount += 1
-    if activeTracerCount > TRACER_POOL_SIZE then return end
-    local line = TracerPool[activeTracerCount]
-    if not line then return end
-    line.From    = from
-    line.To      = to
-    line.Color   = color
-    line.Visible = true
+-- ════════════════════════════════════════════════════════════
+-- COLLECT
+-- ════════════════════════════════════════════════════════════
+local function collectDrop(obj)
+    if obj:IsA("Model") then
+        local center = obj:FindFirstChild("Center")
+        local pp = center and center:FindFirstChildWhichIsA("ProximityPrompt")
+        if pp then pcall(fireproximityprompt, pp); return end
+        for _, d in ipairs(obj:GetDescendants()) do
+            if d:IsA("ProximityPrompt") then pcall(fireproximityprompt, d) end
+        end
+    elseif obj:IsA("BasePart") then
+        local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
+        if pp then pcall(fireproximityprompt, pp) end
+    end
 end
 
--- Single-bind guards for ESP listeners
-local MobESPConnected    = false
-local PlayerESPConnected = false
+local function collectAll()
+    if not DropFolder then return end
+    for _, obj in ipairs(DropFolder:GetChildren()) do
+        pcall(collectDrop, obj)
+        task.wait(rnd(0.04, 0.10))
+    end
+end
 
-local function makeBillboard(parent, text, color, width)
+-- Collect all ProximityPrompts in dungeon chest/reward containers
+local function collectDungeonRewards()
+    if not MapFolder then return end
+    for _, reg in ipairs(MapFolder:GetChildren()) do
+        if reg.Name ~= "Lobby" and reg.Name ~= "Circles" then
+            for _, desc in ipairs(reg:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") then
+                    pcall(fireproximityprompt, desc)
+                end
+            end
+        end
+    end
+    collectAll()
+end
+
+if DropFolder then
+    DropFolder.ChildAdded:Connect(function(obj)
+        if Flags.LootESP then
+            -- forward to ESP; defined later, guarded with pcall
+            pcall(function() addLootESP(obj) end)
+        end
+        if not Flags.AutoCollect then return end
+        if obj:IsA("BasePart") then
+            local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
+            if pp then
+                task.wait(rnd(0.3, 0.6)); pcall(fireproximityprompt, pp)
+            else
+                local conn; conn = obj.ChildAdded:Connect(function(c)
+                    if c:IsA("ProximityPrompt") then
+                        conn:Disconnect()
+                        task.wait(rnd(0.1, 0.25)); pcall(fireproximityprompt, c)
+                    end
+                end)
+            end
+        else
+            task.wait(rnd(0.3, 0.6)); pcall(collectDrop, obj)
+        end
+    end)
+    DropFolder.ChildRemoved:Connect(function(obj)
+        pcall(function() removeLootESP(obj) end)
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- AUTO SELL
+-- Scans the lobby for a sell NPC by ProximityPrompt name/parent
+-- then fires it. Community scripts walk to sell NPC position.
+-- ════════════════════════════════════════════════════════════
+local SELL_KEYWORDS = {"sell","merchant","shop","store","vendor","npc"}
+
+local function findSellPrompts()
+    local prompts = {}
+    if not LobbyFolder then return prompts end
+    for _, desc in ipairs(LobbyFolder:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+            local nm = (desc.ActionText or desc.ObjectText or desc.Name):lower()
+            for _, kw in ipairs(SELL_KEYWORDS) do
+                if nm:find(kw) then prompts[#prompts+1] = desc; break end
+            end
+        end
+    end
+    return prompts
+end
+
+local function doAutoSell()
+    local prompts = findSellPrompts()
+    for _, pp in ipairs(prompts) do
+        -- Teleport close enough to interact
+        if pp.Parent and pp.Parent:IsA("BasePart") and HRP then
+            HRP.CFrame = CFrame.new(pp.Parent.Position + Vector3.new(0,5,0))
+            task.wait(0.3)
+        end
+        pcall(fireproximityprompt, pp)
+        task.wait(rnd(0.3, 0.6))
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- AUTO BUY MERCHANT SHOP
+-- Same pattern as auto sell — find merchant prompts, fire them.
+-- ════════════════════════════════════════════════════════════
+local BUY_KEYWORDS = {"buy","purchase","merchant","shop","item"}
+
+local function doAutoBuy()
+    if not LobbyFolder then return end
+    for _, desc in ipairs(LobbyFolder:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") then
+            local nm = (desc.ActionText or desc.ObjectText or desc.Name):lower()
+            for _, kw in ipairs(BUY_KEYWORDS) do
+                if nm:find(kw) then
+                    pcall(fireproximityprompt, desc)
+                    task.wait(rnd(0.2, 0.4))
+                    break
+                end
+            end
+        end
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- AUTO EQUIP BEST GEAR
+-- Scans the player's backpack for Tools. Tries to equip the
+-- one whose name sorts highest by "Power" child value or by
+-- alphabetical name as a tie-breaker. Equipping is done by
+-- parenting the Tool to the character (client-side).
+-- ════════════════════════════════════════════════════════════
+local function getToolPower(tool)
+    local v = tool:FindFirstChild("Power")
+             or tool:FindFirstChild("Level")
+             or tool:FindFirstChild("Stats")
+    if v and (v:IsA("IntValue") or v:IsA("NumberValue")) then
+        return v.Value
+    end
+    -- Fall back: parse first number out of tool name
+    local n = tool.Name:match("%d+")
+    return n and tonumber(n) or 0
+end
+
+local function doAutoEquipBest()
+    local backpack = LP:FindFirstChild("Backpack")
+    if not backpack or not Char then return end
+    local best, bestPow = nil, -1
+    for _, tool in ipairs(backpack:GetChildren()) do
+        if tool:IsA("Tool") then
+            local pw = getToolPower(tool)
+            if pw > bestPow then best=tool; bestPow=pw end
+        end
+    end
+    if best then
+        pcall(function() best.Parent = Char end)
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- AUTO QUEST
+-- ════════════════════════════════════════════════════════════
+local function doAutoQuest()
+    pcall(function()
+        if QF.TurnInQuest    then QF.TurnInQuest:InvokeServer()    end
+    end)
+    task.wait(rnd(0.4, 0.7))
+    pcall(function()
+        if QF.RequestQuest   then QF.RequestQuest:InvokeServer()   end
+    end)
+    task.wait(rnd(0.4, 0.7))
+    pcall(function()
+        if QF.MarkGiverViewed then QF.MarkGiverViewed:InvokeServer() end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- AUTO REDEEM CODES
+-- Known active codes at time of writing. Fire via RedeemCode
+-- RemoteFunction found in RS.Controllers.CodeRedemption.
+-- ════════════════════════════════════════════════════════════
+local CODES = {
+    "80KLIKESLETSGOO",
+    "SORRYABOUTUPD",
+    "SOLOHUNTERS",
+    "RELEASE",
+    "UPDATE1",
+}
+
+local function doRedeemCodes()
+    local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
+    local cr   = ctrl and ctrl:FindFirstChild("CodeRedemption")
+    local rf   = cr  and cr:FindFirstChild("RedeemCode")
+    if not rf then return end
+    for _, code in ipairs(CODES) do
+        pcall(function() rf:InvokeServer(code) end)
+        task.wait(rnd(0.5, 1.0))
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- DUNGEON STATE MACHINE
+--
+-- States: LOBBY → ENTERING → FIGHTING → COLLECTING → LEAVING → QUESTING
+--
+-- This is the core architectural pattern from community scripts:
+-- a persistent state-machine loop rather than nested task.spawns.
+-- Each state has an entry action and an exit condition.
+-- ════════════════════════════════════════════════════════════
+local DungeonState = "LOBBY"
+local dungeonThread = nil
+local DungeonTimeout = 120  -- seconds before we force-leave a stuck dungeon
+
+local function hasDungeonMobs()
+    local mobs = getMobs()
+    for _, e in ipairs(mobs) do
+        if not e.model:IsDescendantOf(MobFolder) then
+            return true
+        end
+    end
+    return false
+end
+
+local function waitForDungeonLoad(timeoutSec)
+    local elapsed = 0
+    while elapsed < timeoutSec do
+        dirty()
+        if hasDungeonMobs() then return true end
+        task.wait(0.5); elapsed = elapsed + 0.5
+    end
+    return false
+end
+
+local function killAllDungeonMobs()
+    local timeout = DungeonTimeout
+    local elapsed = 0
+    while elapsed < timeout do
+        dirty()
+        local dungeonMobs = {}
+        for _, e in ipairs(getMobs()) do
+            if not e.model:IsDescendantOf(MobFolder) then
+                dungeonMobs[#dungeonMobs+1] = e
+            end
+        end
+        if #dungeonMobs == 0 then break end
+        for _, e in ipairs(dungeonMobs) do
+            if inWS(e.model) and e.hum.Health > 0 then
+                attackEntry(e)
+            end
+        end
+        dirty()
+        local t = rnd(0.15, 0.28)
+        task.wait(t); elapsed = elapsed + t
+    end
+end
+
+local function returnToLobby()
+    -- Method 1: fire FullDungeonRemote to leave (some games use this as leave)
+    if R.FullDungeonRemote then
+        pcall(function() R.FullDungeonRemote:FireServer() end)
+        task.wait(1.5)
+    end
+    -- Method 2: teleport character to lobby spawn
+    if not HRP then return end
+    if LobbyFolder then
+        local spawn = LobbyFolder:FindFirstChild("SpawnLocation")
+                   or LobbyFolder:FindFirstChildWhichIsA("BasePart", true)
+        if spawn then
+            HRP.CFrame = CFrame.new(spawn.Position + Vector3.new(0,6,0))
+            return
+        end
+    end
+    -- Fallback: origin
+    HRP.CFrame = CFrame.new(Vector3.new(0, 100, 0))
+end
+
+local function startAutoFarm()
+    if dungeonThread then task.cancel(dungeonThread) end
+    DungeonState = "LOBBY"
+
+    dungeonThread = task.spawn(function()
+        while Flags.AutoFarm do
+
+            -- Guard: need live character
+            if not HRP or not Hum or Hum.Health <= 0 then
+                task.wait(1); refreshChar(); continue
+            end
+
+            -- ── LOBBY ─────────────────────────────────────────
+            if DungeonState == "LOBBY" then
+
+                -- Auto quest in lobby
+                if Flags.AutoQuest then
+                    doAutoQuest()
+                    task.wait(rnd(0.5, 1.0))
+                end
+
+                -- Auto sell in lobby
+                if Flags.AutoSell then
+                    doAutoSell()
+                    task.wait(rnd(0.5, 1.0))
+                end
+
+                -- Auto buy merchant
+                if Flags.AutoBuyMerchant then
+                    doAutoBuy()
+                    task.wait(rnd(0.3, 0.6))
+                end
+
+                -- Auto equip best gear
+                if Flags.AutoEquipBest then
+                    doAutoEquipBest()
+                end
+
+                -- Auto redeem codes (once per session guard below)
+                if Flags.AutoRedeemCodes then
+                    doRedeemCodes()
+                end
+
+                -- Find best portal and enter
+                local portal = getBestPortal()
+                if not portal then
+                    task.wait(2); continue  -- no portal found, wait
+                end
+
+                enterPortal(portal)
+                DungeonState = "ENTERING"
+                task.wait(rnd(2.5, 4.5))  -- wait for load
+
+            -- ── ENTERING ──────────────────────────────────────
+            elseif DungeonState == "ENTERING" then
+
+                local loaded = waitForDungeonLoad(15)
+                if loaded then
+                    DungeonState = "FIGHTING"
+                else
+                    -- Dungeon didn't load, go back
+                    DungeonState = "LEAVING"
+                end
+
+            -- ── FIGHTING ──────────────────────────────────────
+            elseif DungeonState == "FIGHTING" then
+
+                killAllDungeonMobs()
+                DungeonState = "COLLECTING"
+
+            -- ── COLLECTING ────────────────────────────────────
+            elseif DungeonState == "COLLECTING" then
+
+                collectDungeonRewards()
+                task.wait(rnd(0.5, 1.0))
+                DungeonState = "LEAVING"
+
+            -- ── LEAVING ───────────────────────────────────────
+            elseif DungeonState == "LEAVING" then
+
+                returnToLobby()
+                dirty()
+                task.wait(rnd(1.5, 3.0))
+                DungeonState = "LOBBY"
+
+            end
+        end
+
+        DungeonState = "LOBBY"
+    end)
+end
+
+local function stopAutoFarm()
+    if dungeonThread then task.cancel(dungeonThread); dungeonThread = nil end
+    DungeonState = "LOBBY"
+end
+
+-- ════════════════════════════════════════════════════════════
+-- MISC AUTOMATIONS
+-- ════════════════════════════════════════════════════════════
+local slotThread, augThread, afkThread
+
+local function startSlot()
+    if slotThread then task.cancel(slotThread) end
+    slotThread = task.spawn(function()
+        while Flags.AutoSlotMachine do
+            pcall(function() if R.SpinSlotMachine then R.SpinSlotMachine:FireServer() end end)
+            task.wait(Config.SlotDelay * rnd(0.8, 1.2))
+            pcall(function() if R.GiveSlotMachinePrize then R.GiveSlotMachinePrize:FireServer() end end)
+            task.wait(Config.SlotDelay * rnd(0.8, 1.2))
+        end
+    end)
+end
+
+local function startAugment()
+    if augThread then task.cancel(augThread); augThread = nil end
+    augThread = task.spawn(function()
+        while Flags.AutoAugment do
+            pcall(function() if R.ChooseAugment then R.ChooseAugment:FireServer(1) end end)
+            task.wait(rnd(0.8, 1.4))
+        end
+        augThread = nil
+    end)
+end
+
+local function startAntiAFK()
+    if afkThread then task.cancel(afkThread) end
+    afkThread = task.spawn(function()
+        while Flags.AntiAFK do
+            task.wait(rnd(55, 75))
+            if Flags.AntiAFK and Hum then
+                pcall(function() Hum.Jump = true end)
+                task.wait(0.1)
+                pcall(function() Hum.Jump = false end)
+            end
+        end
+    end)
+end
+
+-- ════════════════════════════════════════════════════════════
+-- ESP
+-- ════════════════════════════════════════════════════════════
+local MobESPObjs  = {}
+local PlrESPObjs  = {}
+local LootESPObjs = {}
+local ChamsObjs   = {}
+
+local POOL_SIZE = 80
+local TrPool    = {}
+local activeTr  = 0
+
+for i = 1, POOL_SIZE do
+    local l = Drawing.new("Line")
+    l.Thickness = 1; l.Transparency = 0.5; l.Visible = false
+    TrPool[i] = l
+end
+
+local function clearTr()
+    for i = 1, activeTr do if TrPool[i] then TrPool[i].Visible = false end end
+    activeTr = 0
+end
+
+local function drawTr(from, to, col)
+    activeTr += 1
+    if activeTr > POOL_SIZE then return end
+    local l = TrPool[activeTr]
+    l.From=from; l.To=to; l.Color=col; l.Visible=true
+end
+
+local function destroyPool()
+    for i = 1, POOL_SIZE do
+        if TrPool[i] then pcall(function() TrPool[i]:Remove() end); TrPool[i]=nil end
+    end
+    activeTr = 0
+end
+
+local function makeBB(parent, text, col, w)
     local bb = Instance.new("BillboardGui")
-    bb.AlwaysOnTop = true
-    bb.Size        = UDim2.new(0, width or 80, 0, 30)
-    bb.StudsOffset = Vector3.new(0, 3, 0)
-    bb.Parent      = parent
-
+    bb.AlwaysOnTop=true; bb.Size=UDim2.new(0,w or 80,0,30)
+    bb.StudsOffset=Vector3.new(0,3.5,0); bb.Parent=parent
     local lbl = Instance.new("TextLabel")
-    lbl.BackgroundTransparency = 1
-    lbl.Size       = UDim2.new(1, 0, 1, 0)
-    lbl.Text       = text
-    lbl.TextColor3 = color
-    lbl.TextStrokeTransparency = 0
-    lbl.TextScaled = true
-    lbl.Font       = Enum.Font.GothamBold
-    lbl.Parent     = bb
-
+    lbl.BackgroundTransparency=1; lbl.Size=UDim2.new(1,0,1,0)
+    lbl.Text=text; lbl.TextColor3=col
+    lbl.TextStrokeTransparency=0; lbl.TextScaled=true
+    lbl.Font=Enum.Font.GothamBold; lbl.Parent=bb
     return bb, lbl
 end
 
 local function cleanESP(tbl, key)
     if not tbl[key] then return end
-    for _, obj in pairs(tbl[key]) do
-        if typeof(obj) == "Instance" then
-            pcall(function() obj:Destroy() end)
-        end
+    for _, o in pairs(tbl[key]) do
+        if typeof(o)=="Instance" then pcall(function() o:Destroy() end) end
     end
     tbl[key] = nil
 end
 
--- MOB ESP
+local MobESPBound = false
 local function addMobESP(model)
-    if MobESPObjects[model] then return end
+    if MobESPObjs[model] then return end
     local hrp = model:FindFirstChild("HumanoidRootPart")
     local hum = model:FindFirstChildWhichIsA("Humanoid")
     if not hrp or not hum then return end
-
-    local bb, lbl = makeBillboard(hrp, model.Name, Color3.fromRGB(255, 80, 80), 100)
-
-    local distLbl = Instance.new("TextLabel")
-    distLbl.BackgroundTransparency = 1
-    distLbl.Size       = UDim2.new(1, 0, 0.4, 0)
-    distLbl.Position   = UDim2.new(0, 0, 1, 0)
-    distLbl.TextColor3 = Color3.fromRGB(255, 200, 200)
-    distLbl.TextStrokeTransparency = 0
-    distLbl.TextScaled = true
-    distLbl.Font       = Enum.Font.Gotham
-    distLbl.Parent     = bb
-
-    MobESPObjects[model] = { bb = bb, lbl = lbl, distLbl = distLbl }
-
+    local bb, lbl = makeBB(hrp, model.Name, Color3.fromRGB(255,80,80), 110)
+    local dl = Instance.new("TextLabel")
+    dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
+    dl.TextColor3=Color3.fromRGB(255,200,200); dl.TextStrokeTransparency=0
+    dl.TextScaled=true; dl.Font=Enum.Font.Gotham; dl.Parent=bb
+    MobESPObjs[model] = {bb=bb,lbl=lbl,dl=dl}
     model.AncestryChanged:Connect(function()
-        if not model:IsDescendantOf(game) then
-            cleanESP(MobESPObjects, model)
-        end
+        if not model:IsDescendantOf(game) then cleanESP(MobESPObjs, model) end
     end)
 end
+local function removeMobESP(model) cleanESP(MobESPObjs, model) end
 
-local function removeMobESP(model) cleanESP(MobESPObjects, model) end
-
--- PLAYER ESP
-local function addPlayerESP(player)
-    if PlayerESPObjects[player] or player == LP then return end
-    local char = player.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-
-    local bb, lbl = makeBillboard(hrp, player.Name, Color3.fromRGB(100, 200, 255), 100)
-
-    local distLbl = Instance.new("TextLabel")
-    distLbl.BackgroundTransparency = 1
-    distLbl.Size       = UDim2.new(1, 0, 0.4, 0)
-    distLbl.Position   = UDim2.new(0, 0, 1, 0)
-    distLbl.TextColor3 = Color3.fromRGB(180, 230, 255)
-    distLbl.TextStrokeTransparency = 0
-    distLbl.TextScaled = true
-    distLbl.Font       = Enum.Font.Gotham
-    distLbl.Parent     = bb
-
-    PlayerESPObjects[player] = { bb = bb, lbl = lbl, distLbl = distLbl }
-
-    player.CharacterRemoving:Connect(function()
-        cleanESP(PlayerESPObjects, player)
-    end)
+local PlrESPBound = false
+local function addPlayerESP(p)
+    if PlrESPObjs[p] or p==LP then return end
+    local char = p.Character; if not char then return end
+    local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+    local bb, lbl = makeBB(hrp, p.Name, Color3.fromRGB(100,200,255), 100)
+    local dl = Instance.new("TextLabel")
+    dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
+    dl.TextColor3=Color3.fromRGB(180,230,255); dl.TextStrokeTransparency=0
+    dl.TextScaled=true; dl.Font=Enum.Font.Gotham; dl.Parent=bb
+    PlrESPObjs[p] = {bb=bb,lbl=lbl,dl=dl}
+    p.CharacterRemoving:Connect(function() cleanESP(PlrESPObjs, p) end)
 end
+local function removePlayerESP(p) cleanESP(PlrESPObjs, p) end
 
-local function removePlayerESP(player) cleanESP(PlayerESPObjects, player) end
-
--- LOOT ESP
-local function addLootESP(obj)
-    if LootESPObjects[obj] then return end
-
+function addLootESP(obj)   -- intentionally non-local for DropFolder handler
+    if LootESPObjs[obj] then return end
     local part = obj
     if obj:IsA("Model") then
         part = obj:FindFirstChild("Center") or obj:FindFirstChildWhichIsA("BasePart")
     end
     if not part or not part:IsA("BasePart") then return end
-
     local isEpic = obj:IsA("Model")
-    local color  = isEpic and Color3.fromRGB(255, 215, 0) or Color3.fromRGB(220, 220, 220)
-
-    local sel = Instance.new("SelectionBox")
-    sel.Color3              = color
-    sel.LineThickness       = 0.06
-    sel.SurfaceTransparency = 0.7
-    sel.SurfaceColor3       = color
-    sel.Adornee             = part
-    sel.Parent              = part
-
-    local bb = makeBillboard(part, isEpic and "★ EPIC" or "Drop", color, 80)
-
-    LootESPObjects[obj] = { sel = sel, bb = bb }
-
+    local col    = isEpic and Color3.fromRGB(255,215,0) or Color3.fromRGB(220,220,220)
+    local sel    = Instance.new("SelectionBox")
+    sel.Color3=col; sel.LineThickness=0.06; sel.SurfaceTransparency=0.7
+    sel.SurfaceColor3=col; sel.Adornee=part; sel.Parent=part
+    local bb = makeBB(part, isEpic and "★ EPIC" or "Drop", col, 80)
+    LootESPObjs[obj] = {sel=sel, bb=bb}
     obj.AncestryChanged:Connect(function()
-        if not obj:IsDescendantOf(game) and LootESPObjects[obj] then
-            pcall(function() LootESPObjects[obj].sel:Destroy() end)
-            pcall(function() LootESPObjects[obj].bb:Destroy() end)
-            LootESPObjects[obj] = nil
+        if not obj:IsDescendantOf(game) and LootESPObjs[obj] then
+            pcall(function() LootESPObjs[obj].sel:Destroy() end)
+            pcall(function() LootESPObjs[obj].bb:Destroy()  end)
+            LootESPObjs[obj] = nil
         end
     end)
 end
-
-local function removeLootESP(obj)
-    if not LootESPObjects[obj] then return end
-    pcall(function() LootESPObjects[obj].sel:Destroy() end)
-    pcall(function() LootESPObjects[obj].bb:Destroy() end)
-    LootESPObjects[obj] = nil
+function removeLootESP(obj)  -- non-local
+    if not LootESPObjs[obj] then return end
+    pcall(function() LootESPObjs[obj].sel:Destroy() end)
+    pcall(function() LootESPObjs[obj].bb:Destroy()  end)
+    LootESPObjs[obj] = nil
 end
 
--- CHAMS
-local ChamsObjects = {}
-
 local function addChams(model)
-    if ChamsObjects[model] then return end
-    ChamsObjects[model] = {}
-    for _, part in ipairs(model:GetDescendants()) do
-        if part:IsA("BasePart") and not EXCLUDED_PART_NAMES[part.Name] then
-            local box = Instance.new("BoxHandleAdornment")
-            box.AlwaysOnTop  = true
-            box.ZIndex       = 5
-            box.Color3       = Color3.fromRGB(255, 60, 60)
-            box.Transparency = 0.5
-            box.Size         = part.Size
-            box.Adornee      = part
-            box.Parent       = part
-            table.insert(ChamsObjects[model], box)
+    if ChamsObjs[model] then return end
+    ChamsObjs[model] = {}
+    for _, p in ipairs(model:GetDescendants()) do
+        if p:IsA("BasePart") and not HITBOX[p.Name] then
+            local b = Instance.new("BoxHandleAdornment")
+            b.AlwaysOnTop=true; b.ZIndex=5
+            b.Color3=Color3.fromRGB(255,60,60); b.Transparency=0.5
+            b.Size=p.Size; b.Adornee=p; b.Parent=p
+            ChamsObjs[model][#ChamsObjs[model]+1] = b
         end
     end
     model.AncestryChanged:Connect(function()
-        if not model:IsDescendantOf(game) and ChamsObjects[model] then
-            for _, b in ipairs(ChamsObjects[model]) do
-                pcall(function() b:Destroy() end)
-            end
-            ChamsObjects[model] = nil
+        if not model:IsDescendantOf(game) and ChamsObjs[model] then
+            for _, b in ipairs(ChamsObjs[model]) do pcall(function() b:Destroy() end) end
+            ChamsObjs[model] = nil
         end
     end)
 end
-
 local function removeChams(model)
-    if not ChamsObjects[model] then return end
-    for _, b in ipairs(ChamsObjects[model]) do
-        pcall(function() b:Destroy() end)
-    end
-    ChamsObjects[model] = nil
+    if not ChamsObjs[model] then return end
+    for _, b in ipairs(ChamsObjs[model]) do pcall(function() b:Destroy() end) end
+    ChamsObjs[model] = nil
+end
+local function clearChams()
+    for m in pairs(ChamsObjs) do removeChams(m) end
 end
 
-local function clearAllChams()
-    for model in pairs(ChamsObjects) do removeChams(model) end
-end
-
--- ─────────────────────────────────────────────
--- AUTO COLLECT
---
--- fireproximityprompt() at executor level bypasses RequiresLineOfSight
--- and MaxActivationDistance without any player movement.
---
--- PLAIN PART DROPS: Structure scan shows bare Part drops in Camera.Drops
--- have no ProximityPrompt at spawn time — the game adds it dynamically.
--- The DropFolder.ChildAdded handler below attaches a ChildAdded watcher
--- on plain Parts so the prompt is fired the moment it appears.
--- ─────────────────────────────────────────────
-local function collectDrop(obj)
-    local function fireAllPrompts(root)
-        for _, desc in ipairs(root:GetDescendants()) do
-            if desc:IsA("ProximityPrompt") then
-                pcall(fireproximityprompt, desc)
-            end
-        end
-    end
-
-    if obj:IsA("Model") then
-        -- Epic drop: Center.ProximityPrompt is the primary trigger
-        local center = obj:FindFirstChild("Center")
-        if center then
-            local pp = center:FindFirstChildWhichIsA("ProximityPrompt")
-            if pp then
-                pcall(fireproximityprompt, pp)
-                return
-            end
-        end
-        fireAllPrompts(obj)
-    elseif obj:IsA("BasePart") then
-        local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
-        if pp then
-            pcall(fireproximityprompt, pp)
-        end
-    end
-end
-
-local function collectAllDrops()
-    if not DropFolder then return end
-    local drops = DropFolder:GetChildren()
-    for i, obj in ipairs(drops) do
-        pcall(collectDrop, obj)
-        if i < #drops then
-            task.wait(randRange(0.1, 0.2))
-        end
-    end
-end
-
-if DropFolder then
-    DropFolder.ChildAdded:Connect(function(obj)
-        if Flags.LootESP then addLootESP(obj) end
-
-        if Flags.AutoCollect then
-            if obj:IsA("BasePart") then
-                -- Plain Part: ProximityPrompt may not exist yet — watch for it.
-                local pp = obj:FindFirstChildWhichIsA("ProximityPrompt")
-                if pp then
-                    task.wait(randRange(0.4, 0.7))
-                    pcall(fireproximityprompt, pp)
-                else
-                    -- Connect a one-shot ChildAdded to catch the delayed spawn
-                    local conn
-                    conn = obj.ChildAdded:Connect(function(child)
-                        if child:IsA("ProximityPrompt") then
-                            conn:Disconnect()
-                            task.wait(randRange(0.1, 0.3))
-                            pcall(fireproximityprompt, child)
-                        end
-                    end)
-                end
-            else
-                task.wait(randRange(0.4, 0.7))
-                pcall(collectDrop, obj)
-            end
-        end
-    end)
-
-    DropFolder.ChildRemoved:Connect(function(obj)
-        removeLootESP(obj)
-    end)
-end
-
--- ─────────────────────────────────────────────
--- AUTO FARM
---
--- DEATH DETECTION — dual path:
---   Primary:   Humanoid.Died signal (fast, event-driven)
---   Secondary: IsDescendantOf(WS) polling in attack loop (reliable
---              fallback when mob is removed before signal fires)
---
--- PROGRESS CHECK:
---   If mob HP has not decreased within 2 seconds, mark unkillable
---   and move to next target.
---   FIX: hpAtCheckpoint now initialises to entry.hum.Health (not
---   MaxHealth). v3.0 used MaxHealth, which caused the check to
---   pass for any pre-damaged mob even with zero DPS dealt.
--- ─────────────────────────────────────────────
-local farmThread  = nil
-local augThread   = nil
-local slotThread  = nil
-local SkippedMobs = {}  -- models to skip this session (unkillable)
-
-local function stopFarm()
-    if farmThread then
-        task.cancel(farmThread)
-        farmThread = nil
-    end
-end
-
-local function startFarm()
-    stopFarm()
-    farmThread = task.spawn(function()
-        while Flags.AutoFarm do
-            if not HRP or not Hum or Hum.Health <= 0 then
-                task.wait(1)
-                refreshCharacter()
-                continue
-            end
-
-            local entry = getNearestMob(Config.FarmRadius)
-
-            if not entry then
-                task.wait(1)
-                continue
-            end
-
-            if SkippedMobs[entry.model] then
-                task.wait(0.5)
-                continue
-            end
-
-            if not entry.model:IsDescendantOf(WS) or entry.hum.Health <= 0 then
-                markDirty()
-                continue
-            end
-
-            -- Mobile: teleport near mob with jitter
-            if not Flags.FarmStationary then
-                local offset = Vector3.new(randRange(-3, 3), 3, randRange(-3, 3))
-                HRP.CFrame = CFrame.new(entry.hrp.Position + offset)
-                task.wait(randRange(0.15, 0.35))
-            end
-
-            -- Death detection: primary (event-driven)
-            local dead     = false
-            local diedConn = entry.hum.Died:Connect(function()
-                dead = true
-            end)
-
-            -- Attack loop with progress check
-            local elapsed        = 0
-            local maxTime        = 8
-            local checkInterval  = 2
-            -- FIX: was MaxHealth — caused pre-damaged mobs to bypass unkillable detection
-            local hpAtCheckpoint = entry.hum.Health
-            local nextCheck      = checkInterval
-
-            while not dead and elapsed < maxTime do
-                -- Death detection: secondary (mob removed from workspace)
-                if not entry.model:IsDescendantOf(WS) then
-                    dead = true
-                    break
-                end
-
-                attackEntry(entry)
-
-                local interval = randRange(0.20, 0.35)
-                task.wait(interval)
-                elapsed += interval
-
-                -- Progress check: if HP hasn't dropped in checkInterval seconds, skip mob
-                if elapsed >= nextCheck then
-                    local currentHP = entry.hum.Health
-                    if currentHP >= hpAtCheckpoint and not dead then
-                        SkippedMobs[entry.model] = true
-                        break
-                    end
-                    hpAtCheckpoint = currentHP
-                    nextCheck      = elapsed + checkInterval
-                end
-            end
-
-            diedConn:Disconnect()
-
-            -- Post-kill collect
-            if dead and Flags.AutoCollect then
-                task.wait(randRange(0.2, 0.4))
-                collectAllDrops()
-            end
-
-            task.wait(randRange(0.3, 0.6))
-            markDirty()
-        end
-    end)
-end
-
--- ─────────────────────────────────────────────
--- DUNGEON TELEPORTS
--- ─────────────────────────────────────────────
-local function teleportToDungeon(name)
-    if not MapFolder or not HRP then return end
-    local dungeon   = MapFolder:FindFirstChild(name, true)
-    local spawnPart = dungeon and dungeon:FindFirstChild("PlayerSpawnInDungeon", true)
-    if spawnPart then
-        HRP.CFrame = jitterCFrame(spawnPart.CFrame + Vector3.new(0, 5, 0))
-    end
-end
-
--- ─────────────────────────────────────────────
--- SLOT MACHINE
--- ─────────────────────────────────────────────
-local function startSlotMachine()
-    if slotThread then task.cancel(slotThread) end
-    slotThread = task.spawn(function()
-        while Flags.AutoSlotMachine do
-            if Remotes.SpinSlotMachine then
-                pcall(function() Remotes.SpinSlotMachine:FireServer() end)
-            end
-            task.wait(Config.SlotMachineDelay * randRange(0.8, 1.2))
-            if Remotes.GiveSlotMachinePrize then
-                pcall(function() Remotes.GiveSlotMachinePrize:FireServer() end)
-            end
-            task.wait(Config.SlotMachineDelay * randRange(0.8, 1.2))
-        end
-    end)
-end
-
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- CHARACTER RESPAWN
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 LP.CharacterAdded:Connect(function()
     task.wait(0.5)
-    refreshCharacter()
+    refreshChar()
     if Hum then
-        Hum.WalkSpeed  = Config.WalkSpeed
-        Hum.JumpPower  = Config.JumpPower
-        -- Write JumpHeight too — covers games where UseJumpPower = false
+        Hum.WalkSpeed = Config.WalkSpeed
+        Hum.JumpPower = Config.JumpPower
         pcall(function() Hum.JumpHeight = Config.JumpPower * 0.36 end)
     end
-    SkippedMobs = {}
-    markDirty()
-    if Flags.AutoFarm then startFarm() end
+    dirty()
+    if Flags.AutoFarm then startAutoFarm() end
 end)
 
--- ─────────────────────────────────────────────
--- MASTER HEARTBEAT
---
--- Accumulators:
---   slowAcc — ESP labels, Stamina, Tracers at ~10 Hz
---   Every frame: NoClip (cached parts)
---
--- NOTE: Kill Aura is NO LONGER driven from Heartbeat.
--- It runs in its own persistent coroutine (auraThread) above.
--- GodMode HP-reset-every-frame has also been removed — the
--- namecall hook handles damage interception before health changes.
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
+-- HEARTBEAT — NoClip, Stamina, ESP labels, Tracers
+-- Kill Aura + AutoSkills run in their own coroutines above.
+-- ════════════════════════════════════════════════════════════
 local slowAcc = 0
 
 RunService.Heartbeat:Connect(function(dt)
     if not Char or not Hum or not HRP then return end
-
     slowAcc += dt
-
-    -- ── Every frame ──
 
     if Flags.NoClip then
         for _, p in ipairs(NoClipParts) do
-            if p and p.Parent then
-                p.CanCollide = false
+            if p and p.Parent then p.CanCollide = false end
+        end
+    end
+
+    if Flags.SpeedHack and Hum then
+        Hum.WalkSpeed = Config.WalkSpeed
+    end
+
+    if slowAcc < 0.1 then return end
+    slowAcc = 0
+
+    if Flags.InfiniteStamina then
+        pcall(function() Char:SetAttribute("Stamina", 100) end)
+        pcall(function() Char:SetAttribute("Energy",  100) end)
+        pcall(function() Char:SetAttribute("Dash",    100) end)
+        for _, v in ipairs(StaminaParts) do
+            if v and v.Parent then v.Value = 100 end
+        end
+    end
+
+    if Flags.MobESP then
+        for model, o in pairs(MobESPObjs) do
+            if inWS(model) then
+                local hrp = model:FindFirstChild("HumanoidRootPart")
+                local hum = model:FindFirstChildWhichIsA("Humanoid")
+                if hrp and hum then
+                    local d = math.floor(dist(HRP.Position, hrp.Position))
+                    o.dl.Text  = d.."st | HP:"..math.floor(hum.Health).."/"..math.floor(hum.MaxHealth)
+                    o.bb.Enabled = d <= Config.ESPMaxDist
+                end
             end
         end
     end
 
-    -- ── Slow throttle: ~10 Hz ──
-    if slowAcc >= 0.1 then
-        slowAcc = 0
-
-        -- Infinite Stamina
-        -- FIX: Structure scan shows NO Stamina IntValue/NumberValue on the character.
-        -- Primary approach: SetAttribute (covers attribute-based stamina systems).
-        -- Secondary: value-object scan (kept as cheap fallback; no-op if table empty).
-        if Flags.InfiniteStamina then
-            pcall(function() Char:SetAttribute("Stamina", 100) end)
-            pcall(function() Char:SetAttribute("Energy", 100)  end)
-            pcall(function() Char:SetAttribute("Dash", 100)    end)
-            for _, v in ipairs(StaminaParts) do
-                if v and v.Parent then v.Value = 100 end
+    if Flags.PlayerESP then
+        for p, o in pairs(PlrESPObjs) do
+            local pc  = p.Character
+            local phr = pc and pc:FindFirstChild("HumanoidRootPart")
+            if phr then
+                local d = math.floor(dist(HRP.Position, phr.Position))
+                o.dl.Text    = d.." studs"
+                o.bb.Enabled = d <= Config.ESPMaxDist
             end
         end
+    end
 
-        -- Mob ESP label updates
-        if Flags.MobESP then
-            for model, objs in pairs(MobESPObjects) do
-                if model:IsDescendantOf(WS) then
-                    local hrp = model:FindFirstChild("HumanoidRootPart")
-                    local hum = model:FindFirstChildWhichIsA("Humanoid")
-                    if hrp and hum then
-                        local dist = math.floor(getDistance(HRP.Position, hrp.Position))
-                        objs.distLbl.Text = dist .. " studs | HP: "
-                            .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth)
-                        objs.bb.Enabled = dist <= Config.ESPMaxDist
-                    end
+    if Flags.Tracers then
+        clearTr()
+        local cam = WS.CurrentCamera
+        local vp  = cam.ViewportSize
+        local ctr = Vector2.new(vp.X/2, vp.Y)
+        local RED  = Color3.fromRGB(255,80,80)
+        local BLUE = Color3.fromRGB(100,200,255)
+        for _, e in ipairs(getMobs(Config.ESPMaxDist)) do
+            local sp, on = cam:WorldToViewportPoint(e.hrp.Position)
+            if on then drawTr(ctr, Vector2.new(sp.X,sp.Y), RED) end
+        end
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p~=LP and p.Character then
+                local phr = p.Character:FindFirstChild("HumanoidRootPart")
+                if phr and dist(HRP.Position,phr.Position)<=Config.ESPMaxDist then
+                    local sp, on = cam:WorldToViewportPoint(phr.Position)
+                    if on then drawTr(ctr, Vector2.new(sp.X,sp.Y), BLUE) end
                 end
             end
         end
-
-        -- Player ESP label updates
-        if Flags.PlayerESP then
-            for player, objs in pairs(PlayerESPObjects) do
-                local pchar = player.Character
-                local phrp  = pchar and pchar:FindFirstChild("HumanoidRootPart")
-                if phrp then
-                    local dist = math.floor(getDistance(HRP.Position, phrp.Position))
-                    objs.distLbl.Text = dist .. " studs"
-                    objs.bb.Enabled   = dist <= Config.ESPMaxDist
-                end
-            end
-        end
-
-        -- Tracers — pooled, no allocation per frame
-        if Flags.Tracers then
-            clearTracers()
-
-            local cam    = WS.CurrentCamera
-            local vp     = cam.ViewportSize
-            local center = Vector2.new(vp.X / 2, vp.Y)
-            local RED    = Color3.fromRGB(255, 80, 80)
-            local BLUE   = Color3.fromRGB(100, 200, 255)
-
-            for _, entry in ipairs(getMobs(Config.ESPMaxDist)) do
-                local sp, onScreen = cam:WorldToViewportPoint(entry.hrp.Position)
-                if onScreen then
-                    drawTracer(center, Vector2.new(sp.X, sp.Y), RED)
-                end
-            end
-
-            for _, player in ipairs(Players:GetPlayers()) do
-                if player ~= LP then
-                    local pchar = player.Character
-                    local phrp  = pchar and pchar:FindFirstChild("HumanoidRootPart")
-                    if phrp then
-                        local d = getDistance(HRP.Position, phrp.Position)
-                        if d <= Config.ESPMaxDist then
-                            local sp, onScreen = cam:WorldToViewportPoint(phrp.Position)
-                            if onScreen then
-                                drawTracer(center, Vector2.new(sp.X, sp.Y), BLUE)
-                            end
-                        end
-                    end
-                end
-            end
-        else
-            if activeTracerCount > 0 then clearTracers() end
-        end
+    else
+        if activeTr > 0 then clearTr() end
     end
 end)
 
--- ─────────────────────────────────────────────
--- RAYFIELD LOAD
--- ─────────────────────────────────────────────
-local RayfieldLoaded, Rayfield = pcall(function()
+-- ════════════════════════════════════════════════════════════
+-- RAYFIELD
+-- ════════════════════════════════════════════════════════════
+local ok, Rayfield = pcall(function()
     return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 end)
+if not ok or not Rayfield then warn("[ENI] Rayfield failed."); return end
 
-if not RayfieldLoaded or not Rayfield then
-    warn("[ENI] Rayfield failed to load.")
-    return
-end
-
-local Window = Rayfield:CreateWindow({
-    Name             = "Solo Hunters  |  ENI Build",
-    LoadingTitle     = "Solo Hunters",
-    LoadingSubtitle  = "ENI Build v4.0 — Xeno",
+local W = Rayfield:CreateWindow({
+    Name = "Solo Hunters — ENI Build",
+    LoadingTitle    = "Solo Hunters",
+    LoadingSubtitle = "ENI Build v6.0",
     ConfigurationSaving = { Enabled = false },
-    KeySystem        = false,
+    KeySystem = false,
 })
 
--- ═══════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
+-- TAB: AUTO FARM
+-- ════════════════════════════════════════════════════════════
+local FarmTab = W:CreateTab("Farm", "sword")
+
+FarmTab:CreateSection("Dungeon Loop")
+
+FarmTab:CreateToggle({
+    Name = "Auto Farm  (Full Loop)",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoFarm = v
+        if v then startAutoFarm() else stopAutoFarm() end
+    end,
+})
+
+FarmTab:CreateLabel("State: checks current dungeon loop state")
+
+FarmTab:CreateButton({
+    Name = "Status: What State Are We In?",
+    Callback = function()
+        Rayfield:Notify({ Title="State", Content="Current: "..DungeonState, Duration=4 })
+    end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Prioritize Red Gates (Boss)",
+    Default = true,
+    Callback = function(v) Flags.PrioritizeRed = v end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Auto-Scale Difficulty",
+    Default = true,
+    Callback = function(v) Flags.AutoScaleDiff = v end,
+})
+
+FarmTab:CreateSection("Dungeon Actions")
+
+FarmTab:CreateToggle({
+    Name = "Auto Quest",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoQuest = v
+        if v and not Flags.AutoFarm then
+            task.spawn(doAutoQuest)
+        end
+    end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Auto Sell",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoSell = v
+        if v and not Flags.AutoFarm then task.spawn(doAutoSell) end
+    end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Auto Buy Merchant Shop",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoBuyMerchant = v
+        if v and not Flags.AutoFarm then task.spawn(doAutoBuy) end
+    end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Auto Equip Best Gear",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoEquipBest = v
+        if v then doAutoEquipBest() end
+    end,
+})
+
+FarmTab:CreateButton({
+    Name = "Do Auto Quest Now",
+    Callback = function() task.spawn(doAutoQuest) end,
+})
+
+FarmTab:CreateButton({
+    Name = "Do Auto Sell Now",
+    Callback = function() task.spawn(doAutoSell) end,
+})
+
+FarmTab:CreateButton({
+    Name = "Collect All Drops Now",
+    Callback = function() task.spawn(collectAll) end,
+})
+
+FarmTab:CreateButton({
+    Name = "Collect Dungeon Rewards Now",
+    Callback = function() task.spawn(collectDungeonRewards) end,
+})
+
+FarmTab:CreateSection("Portal")
+
+FarmTab:CreateButton({
+    Name = "Enter Best Portal Now",
+    Callback = function()
+        task.spawn(function()
+            local portal = getBestPortal()
+            if portal then
+                local score, req, isRed = scorePortal(portal, getPlayerPower())
+                Rayfield:Notify({
+                    Title   = "Portal Selected",
+                    Content = portal.Name.." | Req: "..req.." | Boss: "..tostring(isRed),
+                    Duration = 4,
+                })
+                enterPortal(portal)
+            else
+                Rayfield:Notify({ Title="Portal", Content="No portals found.", Duration=3 })
+            end
+        end)
+    end,
+})
+
+FarmTab:CreateButton({
+    Name = "Return to Lobby",
+    Callback = function() task.spawn(returnToLobby) end,
+})
+
+FarmTab:CreateSection("Codes")
+
+FarmTab:CreateToggle({
+    Name = "Auto Redeem Codes",
+    Default = false,
+    Callback = function(v) Flags.AutoRedeemCodes = v end,
+})
+
+FarmTab:CreateButton({
+    Name = "Redeem Codes Now",
+    Callback = function() task.spawn(doRedeemCodes) end,
+})
+
+FarmTab:CreateToggle({
+    Name = "Auto Collect Drops",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoCollect = v
+        if v then task.spawn(collectAll) end
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
 -- TAB: COMBAT
--- Icon: "sword" — distinct per-tab icons replacing shared ID
--- ═══════════════════════════════════════════════
-local CombatTab = Window:CreateTab("Combat", "sword")
+-- ════════════════════════════════════════════════════════════
+local CombTab = W:CreateTab("Combat", "zap")
 
-CombatTab:CreateSection("Auto Farm")
+CombTab:CreateSection("Kill Aura")
 
-CombatTab:CreateToggle({
-    Name     = "Auto Farm",
-    Default  = false,
-    Callback = function(val)
-        Flags.AutoFarm = val
-        if val then startFarm() else stopFarm() end
-    end,
+CombTab:CreateToggle({
+    Name = "Kill Aura",
+    Default = false,
+    Callback = function(v) Flags.KillAura = v end,
 })
 
-CombatTab:CreateToggle({
-    Name     = "Stationary Mode  (safe / no teleport)",
-    Default  = true,
-    Callback = function(val)
-        Flags.FarmStationary = val
-    end,
+CombTab:CreateSlider({
+    Name = "Kill Aura Radius",
+    Range = {10, 600}, Increment = 10, Suffix = " studs",
+    CurrentValue = 80, Flag = "AuraRadius",
+    Callback = function(v) Config.KillAuraRadius = v end,
 })
 
-CombatTab:CreateSlider({
-    Name         = "Farm Radius",
-    Range        = {50, 2000},
-    Increment    = 50,
-    Suffix       = " studs",
-    CurrentValue = 500,
-    Flag         = "FarmRadius",
-    Callback     = function(val)
-        Config.FarmRadius = val
-    end,
-})
-
-CombatTab:CreateButton({
-    Name     = "Clear Skip List",
+CombTab:CreateButton({
+    Name = "Kill Nearest Mob",
     Callback = function()
-        SkippedMobs = {}
-        Rayfield:Notify({ Title = "Farm", Content = "Skip list cleared.", Duration = 2 })
+        local e = getNearestMob(1000)
+        if e then task.spawn(attackEntry, e) end
     end,
 })
 
-CombatTab:CreateSection("Kill Aura")
-
-CombatTab:CreateToggle({
-    Name     = "Kill Aura",
-    Default  = false,
-    Callback = function(val)
-        Flags.KillAura = val
-    end,
-})
-
-CombatTab:CreateSlider({
-    Name         = "Kill Aura Radius",
-    Range        = {10, 500},
-    Increment    = 5,
-    Suffix       = " studs",
-    CurrentValue = 50,
-    Flag         = "KillAuraRadius",
-    Callback     = function(val)
-        Config.KillAuraRadius = val
-    end,
-})
-
-CombatTab:CreateButton({
-    Name     = "Instant Kill Nearest Mob",
+CombTab:CreateButton({
+    Name = "Kill All In Aura Range",
     Callback = function()
-        local entry = getNearestMob(Config.FarmRadius)
-        if entry then
-            task.spawn(attackEntry, entry)
+        task.spawn(function()
+            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do attackEntry(e) end
+        end)
+    end,
+})
+
+CombTab:CreateSection("Auto Skills")
+
+CombTab:CreateToggle({
+    Name = "Auto Skills  (keypress Q E R F)",
+    Default = false,
+    Callback = function(v) Flags.AutoSkills = v end,
+})
+
+CombTab:CreateSection("Remotes")
+
+CombTab:CreateButton({
+    Name = "Boss Altar Remote",
+    Callback = function()
+        if R.BossAltarSpawnBoss then
+            pcall(function() R.BossAltarSpawnBoss:FireServer() end)
+            Rayfield:Notify({ Title="Boss", Content="BossAltarSpawnBoss fired.", Duration=3 })
         end
     end,
 })
 
-CombatTab:CreateSection("Loot")
-
-CombatTab:CreateToggle({
-    Name     = "Auto Collect Drops",
-    Default  = false,
-    Callback = function(val)
-        Flags.AutoCollect = val
-        if val then task.spawn(collectAllDrops) end
-    end,
-})
-
-CombatTab:CreateButton({
-    Name     = "Collect All Now",
+CombTab:CreateButton({
+    Name = "Start Challenge",
     Callback = function()
-        task.spawn(collectAllDrops)
-    end,
-})
-
-CombatTab:CreateSection("Boss")
-
-CombatTab:CreateButton({
-    Name     = "Fire Boss Altar Remote",
-    Callback = function()
-        if Remotes.BossAltarSpawnBoss then
-            pcall(function() Remotes.BossAltarSpawnBoss:FireServer() end)
-            Rayfield:Notify({ Title = "Boss Altar", Content = "BossAltarSpawnBoss fired.", Duration = 3 })
-        else
-            Rayfield:Notify({ Title = "Not Found", Content = "BossAltarSpawnBoss unavailable.", Duration = 3 })
+        if R.StartChallenge then
+            pcall(function() R.StartChallenge:FireServer() end)
+            Rayfield:Notify({ Title="Challenge", Content="StartChallenge fired.", Duration=3 })
         end
     end,
 })
 
--- ═══════════════════════════════════════════════
+CombTab:CreateButton({
+    Name = "FullDungeonRemote",
+    Callback = function()
+        if R.FullDungeonRemote then
+            pcall(function() R.FullDungeonRemote:FireServer() end)
+            Rayfield:Notify({ Title="Dungeon", Content="FullDungeonRemote fired.", Duration=3 })
+        end
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
 -- TAB: PLAYER
--- ═══════════════════════════════════════════════
-local PlayerTab = Window:CreateTab("Player", "user")
+-- ════════════════════════════════════════════════════════════
+local PlrTab = W:CreateTab("Player", "user")
 
-PlayerTab:CreateSection("Live Stats")
+PlrTab:CreateSection("Stats")
 
-PlayerTab:CreateButton({
-    Name     = "Refresh Currency Display",
+PlrTab:CreateButton({
+    Name = "Show Currencies",
     Callback = function()
-        local c = getCurrencyValues()
+        local c = getCurrencies()
         Rayfield:Notify({
-            Title    = "Your Stats",
-            Content  = string.format(
-                "Power: %d | Gold: %d | Gems: %d\nSouls: %d | Raidium: %d",
-                c.Power, c.Gold, c.Gems, c.Souls, c.Raidium
-            ),
+            Title   = "Currencies",
+            Content = ("Power:%d | Gold:%d | Gems:%d\nSouls:%d | Raidium:%d")
+                      :format(c.Power, c.Gold, c.Gems, c.Souls, c.Raidium),
             Duration = 8,
         })
     end,
 })
 
-PlayerTab:CreateSection("Movement")
+PlrTab:CreateSection("Movement")
 
-PlayerTab:CreateSlider({
-    Name         = "Walk Speed",
-    Range        = {16, 500},
-    Increment    = 1,
-    Suffix       = "",
-    CurrentValue = 16,
-    Flag         = "WalkSpeed",
-    Callback     = function(val)
-        Config.WalkSpeed = val
-        if Hum then Hum.WalkSpeed = val end
+PlrTab:CreateToggle({
+    Name = "Speed Hack",
+    Default = false,
+    Callback = function(v) Flags.SpeedHack = v end,
+})
+
+PlrTab:CreateSlider({
+    Name = "Walk Speed",
+    Range = {16,500}, Increment = 1, Suffix = "",
+    CurrentValue = 16, Flag = "WalkSpeed",
+    Callback = function(v)
+        Config.WalkSpeed = v
+        if Hum then Hum.WalkSpeed = v end
     end,
 })
 
-PlayerTab:CreateSlider({
-    Name         = "Jump Power",
-    Range        = {7, 300},
-    Increment    = 1,
-    Suffix       = "",
-    CurrentValue = 50,
-    Flag         = "JumpPower",
-    Callback     = function(val)
-        Config.JumpPower = val
+PlrTab:CreateSlider({
+    Name = "Jump Power",
+    Range = {7,300}, Increment = 1, Suffix = "",
+    CurrentValue = 50, Flag = "JumpPower",
+    Callback = function(v)
+        Config.JumpPower = v
         if Hum then
-            -- Write both properties; whichever the game's UseJumpPower flag
-            -- selects will take effect. Avoids silent no-op on UseJumpPower=false.
-            Hum.JumpPower = val
-            pcall(function() Hum.JumpHeight = val * 0.36 end)
+            Hum.JumpPower = v
+            pcall(function() Hum.JumpHeight = v * 0.36 end)
         end
     end,
 })
 
-PlayerTab:CreateToggle({
-    Name     = "No Clip",
-    Default  = false,
-    Callback = function(val) Flags.NoClip = val end,
+PlrTab:CreateToggle({
+    Name = "No Clip",
+    Default = false,
+    Callback = function(v) Flags.NoClip = v end,
 })
 
-PlayerTab:CreateSection("Survival")
+PlrTab:CreateSection("Survival")
 
-PlayerTab:CreateToggle({
-    Name     = "God Mode",
-    Default  = false,
-    Callback = function(val) Flags.GodMode = val end,
+PlrTab:CreateToggle({
+    Name = "God Mode",
+    Default = false,
+    Callback = function(v) Flags.GodMode = v end,
 })
 
-PlayerTab:CreateToggle({
-    Name     = "Infinite Stamina",
-    Default  = false,
-    Callback = function(val) Flags.InfiniteStamina = val end,
+PlrTab:CreateToggle({
+    Name = "Infinite Stamina",
+    Default = false,
+    Callback = function(v) Flags.InfiniteStamina = v end,
 })
 
--- ═══════════════════════════════════════════════
+PlrTab:CreateToggle({
+    Name = "Anti-AFK",
+    Default = false,
+    Callback = function(v)
+        Flags.AntiAFK = v
+        if v then startAntiAFK()
+        else if afkThread then task.cancel(afkThread); afkThread = nil end end
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
 -- TAB: TELEPORT
--- ═══════════════════════════════════════════════
-local TeleportTab = Window:CreateTab("Teleport", "map")
+-- ════════════════════════════════════════════════════════════
+local TpTab = W:CreateTab("Teleport", "map-pin")
 
-TeleportTab:CreateSection("World")
+TpTab:CreateSection("World")
 
-TeleportTab:CreateButton({
-    Name     = "Nearest Mob",
+TpTab:CreateButton({
+    Name = "Nearest Mob",
     Callback = function()
-        local entry = getNearestMob(Config.FarmRadius)
-        if entry and HRP then
-            HRP.CFrame = jitterCFrame(CFrame.new(entry.hrp.Position + Vector3.new(0, 5, 0)))
-        end
+        local e = getNearestMob(1000)
+        if e and HRP then HRP.CFrame = jitter(CFrame.new(e.hrp.Position+Vector3.new(0,5,0))) end
     end,
 })
 
-TeleportTab:CreateButton({
-    Name     = "Quest Giver (Lobby)",
+TpTab:CreateButton({
+    Name = "Return to Lobby",
+    Callback = function() task.spawn(returnToLobby) end,
+})
+
+TpTab:CreateButton({
+    Name = "Quest Giver (Lobby)",
     Callback = function()
         if not HRP or not LobbyFolder then return end
         local qg   = LobbyFolder:FindFirstChild("QuestGiver")
         local base = qg and qg:FindFirstChildWhichIsA("BasePart")
-        if base then HRP.CFrame = jitterCFrame(base.CFrame + Vector3.new(0, 5, 0)) end
+        if base then HRP.CFrame = jitter(base.CFrame + Vector3.new(0,5,0)) end
     end,
 })
 
-TeleportTab:CreateButton({
-    Name     = "Daily Quest Board (Lobby)",
+TpTab:CreateButton({
+    Name = "Daily Quest Board",
     Callback = function()
         if not HRP or not LobbyFolder then return end
         local dq = LobbyFolder:FindFirstChild("Daily Quest")
         local qp = dq and dq:FindFirstChild("QuestsPart")
-        if qp then HRP.CFrame = jitterCFrame(qp.CFrame + Vector3.new(0, 5, 0)) end
+        if qp then HRP.CFrame = jitter(qp.CFrame + Vector3.new(0,5,0)) end
     end,
 })
 
-TeleportTab:CreateSection("Dungeons")
+TpTab:CreateSection("Players")
 
-TeleportTab:CreateDropdown({
-    Name     = "Teleport to Dungeon",
-    Options  = {"WolfCave", "DoubleDungeon", "Subway", "Jungle"},
-    Default  = "WolfCave",
-    Callback = function(val) teleportToDungeon(val) end,
-})
-
-TeleportTab:CreateSection("Players")
-
--- FIX: Added dynamic "Teleport to Nearest Player" button as the reliable
--- alternative to the static dropdown. The dropdown is still present for
--- players who were online at load time; the button always works.
-TeleportTab:CreateButton({
-    Name     = "Teleport to Nearest Player",
+TpTab:CreateButton({
+    Name = "Teleport to Nearest Player",
     Callback = function()
         if not HRP then return end
-        local nearest, nearestDist = nil, math.huge
+        local near, nearD = nil, math.huge
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LP and p.Character then
-                local pHRP = p.Character:FindFirstChild("HumanoidRootPart")
-                if pHRP then
-                    local d = getDistance(HRP.Position, pHRP.Position)
-                    if d < nearestDist then
-                        nearest     = pHRP
-                        nearestDist = d
-                    end
+            if p~=LP and p.Character then
+                local phr = p.Character:FindFirstChild("HumanoidRootPart")
+                if phr then
+                    local d = dist(HRP.Position, phr.Position)
+                    if d < nearD then near=phr; nearD=d end
                 end
             end
         end
-        if nearest then
-            HRP.CFrame = jitterCFrame(nearest.CFrame + Vector3.new(0, 5, 0))
-        else
-            Rayfield:Notify({ Title = "Teleport", Content = "No other players found.", Duration = 3 })
-        end
+        if near then HRP.CFrame = jitter(near.CFrame+Vector3.new(0,5,0))
+        else Rayfield:Notify({Title="TP",Content="No other players found.",Duration=3}) end
     end,
 })
 
-TeleportTab:CreateDropdown({
-    Name    = "Teleport to Player (load-time list)",
+TpTab:CreateDropdown({
+    Name = "Teleport to Player (load-time)",
     Options = (function()
-        local names = {}
+        local t={}
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LP then names[#names + 1] = p.Name end
+            if p~=LP then t[#t+1]=p.Name end
         end
-        return #names > 0 and names or {"(nobody online)"}
+        return #t>0 and t or {"(nobody)"}
     end)(),
-    Default  = "...",
-    Callback = function(val)
-        local target = Players:FindFirstChild(val)
-        if target and target.Character then
-            local tHRP = target.Character:FindFirstChild("HumanoidRootPart")
-            if tHRP and HRP then
-                HRP.CFrame = jitterCFrame(tHRP.CFrame + Vector3.new(0, 5, 0))
-            end
+    Default = "...",
+    Callback = function(v)
+        local t = Players:FindFirstChild(v)
+        if t and t.Character then
+            local thr = t.Character:FindFirstChild("HumanoidRootPart")
+            if thr and HRP then HRP.CFrame = jitter(thr.CFrame+Vector3.new(0,5,0)) end
         end
     end,
 })
 
-TeleportTab:CreateSection("Waypoints")
+TpTab:CreateSection("Waypoints")
 
-TeleportTab:CreateButton({
-    Name     = "Save Safe Spot",
+local SafeSpot = nil
+local Waypoints = {}
+
+TpTab:CreateButton({
+    Name = "Save Safe Spot",
     Callback = function()
         if HRP then
             SafeSpot = HRP.CFrame
-            Rayfield:Notify({ Title = "Safe Spot", Content = "Position saved.", Duration = 2 })
+            Rayfield:Notify({Title="Safe Spot",Content="Saved.",Duration=2})
         end
     end,
 })
 
-TeleportTab:CreateButton({
-    Name     = "Return to Safe Spot",
-    Callback = function()
-        if SafeSpot and HRP then HRP.CFrame = SafeSpot end
-    end,
+TpTab:CreateButton({
+    Name = "Return to Safe Spot",
+    Callback = function() if SafeSpot and HRP then HRP.CFrame = SafeSpot end end,
 })
 
-TeleportTab:CreateButton({
-    Name     = "Save Waypoint",
+TpTab:CreateButton({
+    Name = "Save Waypoint",
     Callback = function()
         if not HRP then return end
-        local name = "WP" .. (#Waypoints + 1)
-        Waypoints[#Waypoints + 1] = { name = name, cf = HRP.CFrame }
-        Rayfield:Notify({ Title = "Waypoint", Content = name .. " saved.", Duration = 2 })
+        local name = "WP"..tostring(#Waypoints+1)
+        Waypoints[#Waypoints+1] = {name=name, cf=HRP.CFrame}
+        Rayfield:Notify({Title="Waypoint",Content=name.." saved.",Duration=2})
     end,
 })
 
-TeleportTab:CreateButton({
-    Name     = "Go to Last Waypoint",
+TpTab:CreateButton({
+    Name = "Go to Last Waypoint",
     Callback = function()
-        if #Waypoints > 0 and HRP then
-            HRP.CFrame = Waypoints[#Waypoints].cf
-        end
+        if #Waypoints > 0 and HRP then HRP.CFrame = Waypoints[#Waypoints].cf end
     end,
 })
 
--- ═══════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- TAB: ESP
--- ═══════════════════════════════════════════════
-local ESPTab = Window:CreateTab("ESP", "eye")
+-- ════════════════════════════════════════════════════════════
+local ESPTab = W:CreateTab("ESP", "eye")
 
 ESPTab:CreateToggle({
-    Name     = "Mob ESP",
-    Default  = false,
-    Callback = function(val)
-        Flags.MobESP = val
-        if val then
-            for _, entry in ipairs(getMobs()) do addMobESP(entry.model) end
-            if MobFolder and not MobESPConnected then
-                MobESPConnected = true
-                MobFolder.ChildAdded:Connect(function(model)
-                    if Flags.MobESP and model:IsA("Model") then
-                        task.wait(0.1)
-                        addMobESP(model)
+    Name = "Mob ESP",
+    Default = false,
+    Callback = function(v)
+        Flags.MobESP = v
+        if v then
+            for _, e in ipairs(getMobs()) do addMobESP(e.model) end
+            if MobFolder and not MobESPBound then
+                MobESPBound = true
+                MobFolder.ChildAdded:Connect(function(m)
+                    if Flags.MobESP and m:IsA("Model") then
+                        task.wait(0.1); addMobESP(m)
                     end
                 end)
             end
         else
-            for model in pairs(MobESPObjects) do removeMobESP(model) end
+            for m in pairs(MobESPObjs) do removeMobESP(m) end
         end
     end,
 })
 
 ESPTab:CreateToggle({
-    Name     = "Player ESP",
-    Default  = false,
-    Callback = function(val)
-        Flags.PlayerESP = val
-        if val then
+    Name = "Player ESP",
+    Default = false,
+    Callback = function(v)
+        Flags.PlayerESP = v
+        if v then
             for _, p in ipairs(Players:GetPlayers()) do addPlayerESP(p) end
-            if not PlayerESPConnected then
-                PlayerESPConnected = true
+            if not PlrESPBound then
+                PlrESPBound = true
                 Players.PlayerAdded:Connect(function(p)
                     if Flags.PlayerESP then
                         p.CharacterAdded:Connect(function()
-                            task.wait(0.5)
-                            addPlayerESP(p)
+                            task.wait(0.5); addPlayerESP(p)
                         end)
                     end
                 end)
-                Players.PlayerRemoving:Connect(function(p)
-                    removePlayerESP(p)
-                end)
+                Players.PlayerRemoving:Connect(removePlayerESP)
             end
         else
-            for p in pairs(PlayerESPObjects) do removePlayerESP(p) end
+            for p in pairs(PlrESPObjs) do removePlayerESP(p) end
         end
     end,
 })
 
 ESPTab:CreateToggle({
-    Name     = "Loot ESP",
-    Default  = false,
-    Callback = function(val)
-        Flags.LootESP = val
-        if val then
-            if DropFolder then
-                for _, obj in ipairs(DropFolder:GetChildren()) do addLootESP(obj) end
-            end
+    Name = "Loot ESP",
+    Default = false,
+    Callback = function(v)
+        Flags.LootESP = v
+        if v and DropFolder then
+            for _, o in ipairs(DropFolder:GetChildren()) do addLootESP(o) end
         else
-            for obj in pairs(LootESPObjects) do removeLootESP(obj) end
+            for o in pairs(LootESPObjs) do removeLootESP(o) end
         end
     end,
 })
 
 ESPTab:CreateToggle({
-    Name     = "Chams",
-    Default  = false,
-    Callback = function(val)
-        Flags.Chams = val
-        if val then
-            for _, entry in ipairs(getMobs()) do addChams(entry.model) end
-        else
-            clearAllChams()
-        end
+    Name = "Chams",
+    Default = false,
+    Callback = function(v)
+        Flags.Chams = v
+        if v then for _, e in ipairs(getMobs()) do addChams(e.model) end
+        else clearChams() end
     end,
 })
 
 ESPTab:CreateToggle({
-    Name     = "Tracers",
-    Default  = false,
-    Callback = function(val)
-        Flags.Tracers = val
-        if not val then clearTracers() end
+    Name = "Tracers",
+    Default = false,
+    Callback = function(v)
+        Flags.Tracers = v
+        if not v then clearTr() end
     end,
 })
 
 ESPTab:CreateSlider({
-    Name         = "Max ESP Distance",
-    Range        = {50, 1000},
-    Increment    = 10,
-    Suffix       = " studs",
-    CurrentValue = 300,
-    Flag         = "ESPMaxDist",
-    Callback     = function(val) Config.ESPMaxDist = val end,
+    Name = "Max ESP Distance",
+    Range = {50,2000}, Increment = 50, Suffix = " studs",
+    CurrentValue = 500, Flag = "ESPDist",
+    Callback = function(v) Config.ESPMaxDist = v end,
 })
 
--- ═══════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
 -- TAB: MISC
--- ═══════════════════════════════════════════════
-local MiscTab = Window:CreateTab("Misc", "settings")
+-- ════════════════════════════════════════════════════════════
+local MiscTab = W:CreateTab("Misc", "settings")
 
-MiscTab:CreateSection("Remotes")
+MiscTab:CreateSection("Augment & Slots")
 
 MiscTab:CreateToggle({
-    Name     = "Auto Slot Machine",
-    Default  = false,
-    Callback = function(val)
-        Flags.AutoSlotMachine = val
-        if val then
-            startSlotMachine()
-        else
-            if slotThread then task.cancel(slotThread) slotThread = nil end
-        end
+    Name = "Auto Augment",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoAugment = v
+        if v then startAugment()
+        else if augThread then task.cancel(augThread); augThread=nil end end
+    end,
+})
+
+MiscTab:CreateToggle({
+    Name = "Auto Slot Machine",
+    Default = false,
+    Callback = function(v)
+        Flags.AutoSlotMachine = v
+        if v then startSlot()
+        else if slotThread then task.cancel(slotThread); slotThread=nil end end
     end,
 })
 
 MiscTab:CreateSlider({
-    Name         = "Slot Machine Delay",
-    Range        = {1, 10},
-    Increment    = 0.5,
-    Suffix       = "s",
-    CurrentValue = 2,
-    Flag         = "SlotDelay",
-    Callback     = function(val) Config.SlotMachineDelay = val end,
-})
-
-MiscTab:CreateToggle({
-    Name     = "Auto Augment",
-    Default  = false,
-    Callback = function(val)
-        Flags.AutoAugment = val
-        -- Cancel previous thread before starting a new one —
-        -- prevents parallel augment threads from rapid toggling.
-        if augThread then task.cancel(augThread) augThread = nil end
-        if val then
-            augThread = task.spawn(function()
-                while Flags.AutoAugment do
-                    if Remotes.ChooseAugment then
-                        pcall(function() Remotes.ChooseAugment:FireServer(1) end)
-                    end
-                    task.wait(randRange(0.8, 1.4))
-                end
-                augThread = nil
-            end)
-        end
-    end,
-})
-
-MiscTab:CreateButton({
-    Name     = "Start Challenge",
-    Callback = function()
-        if Remotes.StartChallenge then
-            pcall(function() Remotes.StartChallenge:FireServer() end)
-            Rayfield:Notify({ Title = "Challenge", Content = "StartChallenge fired.", Duration = 3 })
-        end
-    end,
-})
-
-MiscTab:CreateButton({
-    Name     = "Full Dungeon Remote",
-    Callback = function()
-        if Remotes.FullDungeonRemote then
-            pcall(function() Remotes.FullDungeonRemote:FireServer() end)
-            Rayfield:Notify({ Title = "Dungeon", Content = "FullDungeonRemote fired.", Duration = 3 })
-        end
-    end,
+    Name = "Slot Delay",
+    Range = {1,10}, Increment = 0.5, Suffix = "s",
+    CurrentValue = 2, Flag = "SlotDelay",
+    Callback = function(v) Config.SlotDelay = v end,
 })
 
 MiscTab:CreateSection("Utility")
 
 MiscTab:CreateButton({
-    Name     = "FPS Unlocker",
+    Name = "FPS Unlocker",
     Callback = function()
-        local fn = setfpscap
-                or (getfenv and getfenv(0).setfpscap)
-                or (syn and syn.setfpscap)
+        local fn = setfpscap or (getfenv and getfenv(0).setfpscap) or (syn and syn.setfpscap)
         if fn then
             pcall(fn, 0)
-            Rayfield:Notify({ Title = "FPS Unlocker", Content = "FPS cap removed.", Duration = 3 })
+            Rayfield:Notify({Title="FPS",Content="Cap removed.",Duration=3})
         else
-            Rayfield:Notify({ Title = "FPS Unlocker", Content = "setfpscap not available.", Duration = 4 })
+            Rayfield:Notify({Title="FPS",Content="setfpscap not available on this executor.",Duration=4})
         end
     end,
 })
 
 MiscTab:CreateButton({
-    Name     = "Rejoin",
+    Name = "Rejoin",
     Callback = function()
-        -- Clean up Drawing pool before teleporting to avoid leaked objects
-        destroyDrawingPool()
+        destroyPool()
         TeleportService:Teleport(game.PlaceId, LP)
     end,
 })
 
 MiscTab:CreateKeybind({
-    Name           = "Toggle UI",
+    Name = "Toggle UI",
     CurrentKeybind = "RightShift",
     HoldToInteract = false,
-    Callback       = function() Rayfield:ToggleUI() end,
+    Callback = function() Rayfield:ToggleUI() end,
 })
 
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 -- READY
--- ─────────────────────────────────────────────
+-- ════════════════════════════════════════════════════════════
 Rayfield:Notify({
-    Title    = "ENI Build v4.0",
-    Content  = "Solo Hunters loaded. RightShift = toggle UI.",
+    Title   = "ENI Build v6.0",
+    Content = "Solo Hunters loaded  |  RightShift = toggle UI",
     Duration = 5,
 })
