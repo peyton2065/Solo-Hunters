@@ -1,6 +1,6 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║          SOLO HUNTERS — ENI BUILD  v6.0                  ║
+    ║          SOLO HUNTERS — ENI BUILD  v6.2                  ║
     ║          Xeno Executor  |  Community-Architecture Rewrite ║
     ╚══════════════════════════════════════════════════════════╝
 
@@ -34,7 +34,7 @@
       ✦ Anti-AFK — periodic dummy jump
       ✦ All v4.0 bugfixes retained
 
-    BUGFIXES RETAINED FROM AUDIT:
+    BUGFIXES RETAINED FROM v6.0 AUDIT:
       ✓ Kill Aura: single persistent coroutine, no thread storm
       ✓ hpAtCheckpoint = current HP, not MaxHealth
       ✓ Currency path: MainUIController under RS.Controllers
@@ -44,11 +44,103 @@
       ✓ Plain Part drops: deferred ProximityPrompt listener
       ✓ Drawing pool: destroyPool() on rejoin
       ✓ DropFolder nil: diagnostic warn
+
+    ═══════════════════════════════════════════════════════════
+    CHANGELOG v6.0 → v6.1  (ENI audit pass)
+    ═══════════════════════════════════════════════════════════
+
+    FIX 1 — [CRITICAL] Flags.AutoScaleDiff was declared, exposed
+      in UI, but never read by scorePortal(). The toggle did
+      nothing. scorePortal() now wraps its power-scaling logic
+      in `if Flags.AutoScaleDiff` and falls back to a flat score
+      of 75 when the flag is off, making the toggle functional.
+
+    FIX 2 — [CRITICAL] doRedeemCodes() fired every single LOBBY
+      iteration when AutoRedeemCodes was enabled. The "once per
+      session guard" mentioned in the comment was never written.
+      Added `codesRedeemedThisSession` boolean; doRedeemCodes()
+      now only executes once per script load, and "Redeem Codes
+      Now" button resets the guard so manual re-fire still works.
+
+    FIX 3 — [CRITICAL] getBestPortal() returned a portal even
+      when ALL portals were heavily penalized (score = -9999),
+      because bestScore initialized to -math.huge. The farm loop
+      would then try to enter a portal the player cannot clear,
+      looping forever. Added a score floor: returns nil when
+      bestScore < -500 (all portals out of reach).
+
+    FIX 4 — [IMPORTANT] QUESTING state was listed in the
+      architecture header and the DungeonState variable but had
+      no corresponding branch in the state machine. Quest actions
+      were crammed into LOBBY passively. Added a proper QUESTING
+      state entered after LEAVING: teleports to QuestGiver,
+      calls doAutoQuest(), then advances to LOBBY.
+
+    FIX 5 — [IMPORTANT] SELL_KEYWORDS and BUY_KEYWORDS shared
+      "merchant" and "shop". When both AutoSell and AutoBuyMerchant
+      were active, any matching prompt fired twice in rapid
+      succession. BUY_KEYWORDS now uses exclusive terms only:
+      {"buy","purchase","item","trade"}.
+
+    FIX 6 — [IMPORTANT] killAllDungeonMobs() accumulated elapsed
+      time using the *requested* wait value (t), not the *actual*
+      delta returned by task.wait(). Under load, task.wait()
+      overshoots; using the requested value caused DungeonTimeout
+      to undercount real elapsed time, effectively making the
+      timeout longer than configured. Now uses actual return value.
+
+    FIX 7 — [MINOR] dl TextLabels in addMobESP() and
+      addPlayerESP() had no initial .Text assignment. On the
+      first Heartbeat tick (~16ms) they rendered blank before
+      populating, causing a visible one-frame flash. Set to "".
+
+    FIX 8 — [MINOR] Tracer pool POOL_SIZE was 80. At ESPMaxDist
+      values above ~250 studs with many mobs, getMobs() returns
+      more than 80 entries and drawTr() silently clips the rest.
+      Increased to 200. Pool is now also config-driven via
+      Config.TracerPoolSize so it can be adjusted without source
+      edits.
+
+    FIX 9 — [MINOR] scorePortal() with req==0 (catch-all portals)
+      always resolved to score ≈ 20 due to the diff/math.max(req,1)
+      formula clamping. Catch-all circles now short-circuit to a
+      score of 50 (selectable fallback) and skip the power check.
+
+    ═══════════════════════════════════════════════════════════
+    CHANGELOG v6.1 → v6.2  (Xeno Executor hardening pass)
+    ═══════════════════════════════════════════════════════════
+
+    FIX 10 — [CRITICAL / XENO] Drawing pool initialized at the
+      top level with no pcall protection. Under Xeno's execution
+      model (script runs inside an overwritten CoreGui corescript),
+      any unhandled top-level error surfaces as a "CoreGui.XXX"
+      error message. If Drawing has a timing hiccup on injection,
+      the 200-object loop would throw and kill the entire script
+      before Rayfield even loads. The pool init is now wrapped in
+      pcall with a graceful fallback: Drawing disabled, Tracers
+      flag forced false, and a warn() so the user knows why.
+
+    FIX 11 — [IMPORTANT / XENO] No double-load guard. Re-executing
+      the script stacked a second Heartbeat listener, a second Kill
+      Aura coroutine, and 200 additional Drawing objects on top of
+      the existing ones. Added getgenv().ENI_LOADED guard at the
+      very top: second execution returns immediately after printing
+      a notice, preventing all resource duplication.
 ]]
 
 -- ════════════════════════════════════════════════════════════
 -- SERVICES
 -- ════════════════════════════════════════════════════════════
+
+-- FIX 11: Double-load guard. Re-executing the script in Xeno
+-- would stack a second Heartbeat listener, second Kill Aura
+-- coroutine, and 200 more Drawing objects. This guard makes the
+-- second execution bail out immediately and cleanly.
+if getgenv and getgenv().ENI_SOLO_LOADED then
+    print("[ENI] Already loaded — re-execution blocked. Rejoin or use the Rejoin button to reset.")
+    return
+end
+if getgenv then getgenv().ENI_SOLO_LOADED = true end
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -167,7 +259,7 @@ local Flags = {
     AutoEquipBest   = false,
     AutoRedeemCodes = false,
     PrioritizeRed   = true,    -- boss portals first (community default)
-    AutoScaleDiff   = true,    -- pick portal tier by Power stat
+    AutoScaleDiff   = true,    -- pick portal tier by Power stat (FIX 1)
 
     -- Combat
     KillAura        = false,
@@ -199,6 +291,7 @@ local Config = {
     JumpPower        = 50,
     ESPMaxDist       = 500,
     SlotDelay        = 2,
+    TracerPoolSize   = 200,    -- FIX 8: was hardcoded 80; now config-driven
 
     -- Skill keys (Xeno keypress codes): adjust to your class keybinds
     -- Format: {keyCode, cooldown_seconds}
@@ -447,15 +540,20 @@ end
 -- marked by a red/orange color value on the Gate part, or by
 -- the circle model's name containing "Boss" or "Red".
 --
--- Score formula:
---   Base: 100 - abs(playerPower - portalReq) / portalReq * 100
+-- Score formula (when AutoScaleDiff = true):
+--   Base: 100 - abs(playerPower - portalReq) / portalReq * 50
 --   Boss bonus: +500 if Flags.PrioritizeRed
---   Too weak penalty: -999 if playerPower < portalReq * 0.8
+--   Too weak penalty: -9999 if playerPower < portalReq * 0.8
+--   Catch-all (req==0): flat 50 — always selectable fallback (FIX 9)
+--
+-- Score formula (when AutoScaleDiff = false):  (FIX 1)
+--   All portals score a flat 75 (boss bonus still applies if
+--   PrioritizeRed is on). Player power is ignored entirely.
 -- ════════════════════════════════════════════════════════════
 local PORTAL_POWER_TAGS = {
     -- map circle model names → approximate power requirement
     -- Update these as the game adds new difficulty tiers.
-    ["Circle"]   = 0,     -- catch-all default
+    ["Circle"]   = 0,     -- catch-all default (FIX 9: scores 50 flat)
     ["Easy"]     = 500,
     ["Normal"]   = 1000,
     ["Hard"]     = 2500,
@@ -495,13 +593,23 @@ local function scorePortal(circle, playerPower)
     local isRed  = isRedPortal(circle)
     local score  = 0
 
-    -- Too weak: heavily penalise
-    if playerPower < req * 0.8 then
-        score = -9999
+    -- FIX 9: catch-all portals (req == 0) skip power check entirely.
+    -- They score a flat 50 — always reachable fallback.
+    if req == 0 then
+        score = 50
+    -- FIX 1: only apply power-scaling logic when AutoScaleDiff is enabled.
+    elseif Flags.AutoScaleDiff then
+        -- Too weak: heavily penalise
+        if playerPower < req * 0.8 then
+            score = -9999
+        else
+            -- Prefer portals just within reach
+            local diff = playerPower - req
+            score = 100 - math.min(diff / math.max(req, 1) * 50, 80)
+        end
     else
-        -- Prefer portals just within reach (matches Auto-Scale Difficulty)
-        local diff = playerPower - req
-        score = 100 - math.min(diff / math.max(req, 1) * 50, 80)
+        -- AutoScaleDiff off: ignore power entirely, flat score for all portals
+        score = 75
     end
 
     if isRed and Flags.PrioritizeRed then score = score + 500 end
@@ -522,6 +630,12 @@ local function getBestPortal()
             end
         end
     end
+
+    -- FIX 3: if every portal scored below the penalty floor, the player
+    -- is too weak for all of them. Return nil so the farm loop waits
+    -- instead of hammering an unenterable portal repeatedly.
+    if bestScore < -500 then return nil end
+
     return best
 end
 
@@ -657,9 +771,12 @@ end
 
 -- ════════════════════════════════════════════════════════════
 -- AUTO BUY MERCHANT SHOP
--- Same pattern as auto sell — find merchant prompts, fire them.
+-- FIX 5: BUY_KEYWORDS now uses exclusive terms only ("buy",
+-- "purchase", "item", "trade"). Removed "merchant" and "shop"
+-- which were shared with SELL_KEYWORDS, causing double-fires
+-- when both AutoSell and AutoBuyMerchant were active.
 -- ════════════════════════════════════════════════════════════
-local BUY_KEYWORDS = {"buy","purchase","merchant","shop","item"}
+local BUY_KEYWORDS = {"buy","purchase","item","trade"}
 
 local function doAutoBuy()
     if not LobbyFolder then return end
@@ -732,6 +849,12 @@ end
 -- AUTO REDEEM CODES
 -- Known active codes at time of writing. Fire via RedeemCode
 -- RemoteFunction found in RS.Controllers.CodeRedemption.
+--
+-- FIX 2: Added codesRedeemedThisSession guard. The original
+-- doRedeemCodes() was called every LOBBY iteration with no
+-- guard, causing it to fire every few seconds indefinitely.
+-- The flag resets only when the user presses "Redeem Codes Now"
+-- manually, so deliberate re-fires are still possible.
 -- ════════════════════════════════════════════════════════════
 local CODES = {
     "80KLIKESLETSGOO",
@@ -741,7 +864,11 @@ local CODES = {
     "UPDATE1",
 }
 
-local function doRedeemCodes()
+local codesRedeemedThisSession = false  -- FIX 2: session guard
+
+local function doRedeemCodes(forceRetry)
+    -- forceRetry = true allows the manual button to bypass the guard
+    if codesRedeemedThisSession and not forceRetry then return end
     local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
     local cr   = ctrl and ctrl:FindFirstChild("CodeRedemption")
     local rf   = cr  and cr:FindFirstChild("RedeemCode")
@@ -750,6 +877,7 @@ local function doRedeemCodes()
         pcall(function() rf:InvokeServer(code) end)
         task.wait(rnd(0.5, 1.0))
     end
+    codesRedeemedThisSession = true  -- mark so the farm loop won't repeat
 end
 
 -- ════════════════════════════════════════════════════════════
@@ -757,9 +885,11 @@ end
 --
 -- States: LOBBY → ENTERING → FIGHTING → COLLECTING → LEAVING → QUESTING
 --
--- This is the core architectural pattern from community scripts:
--- a persistent state-machine loop rather than nested task.spawns.
--- Each state has an entry action and an exit condition.
+-- FIX 4: Added QUESTING state. Previously QUESTING was listed
+-- in the architecture header but had no corresponding branch;
+-- quest calls were crammed into LOBBY. QUESTING now runs after
+-- LEAVING: teleports to QuestGiver, calls doAutoQuest(), then
+-- advances back to LOBBY for the next run.
 -- ════════════════════════════════════════════════════════════
 local DungeonState = "LOBBY"
 local dungeonThread = nil
@@ -803,8 +933,12 @@ local function killAllDungeonMobs()
             end
         end
         dirty()
-        local t = rnd(0.15, 0.28)
-        task.wait(t); elapsed = elapsed + t
+        -- FIX 6: use the actual delta returned by task.wait() rather than
+        -- the requested value. task.wait() can overshoot under load; using
+        -- the requested value caused the timeout counter to undercount real
+        -- elapsed time, making DungeonTimeout effectively longer than set.
+        local actual = task.wait(rnd(0.15, 0.28))
+        elapsed = elapsed + actual
     end
 end
 
@@ -843,12 +977,6 @@ local function startAutoFarm()
             -- ── LOBBY ─────────────────────────────────────────
             if DungeonState == "LOBBY" then
 
-                -- Auto quest in lobby
-                if Flags.AutoQuest then
-                    doAutoQuest()
-                    task.wait(rnd(0.5, 1.0))
-                end
-
                 -- Auto sell in lobby
                 if Flags.AutoSell then
                     doAutoSell()
@@ -866,15 +994,15 @@ local function startAutoFarm()
                     doAutoEquipBest()
                 end
 
-                -- Auto redeem codes (once per session guard below)
+                -- FIX 2: Auto redeem codes — guarded, fires once per session only
                 if Flags.AutoRedeemCodes then
-                    doRedeemCodes()
+                    doRedeemCodes(false)
                 end
 
                 -- Find best portal and enter
                 local portal = getBestPortal()
                 if not portal then
-                    task.wait(2); continue  -- no portal found, wait
+                    task.wait(2); continue  -- no portal found or all out of reach
                 end
 
                 enterPortal(portal)
@@ -911,6 +1039,28 @@ local function startAutoFarm()
                 returnToLobby()
                 dirty()
                 task.wait(rnd(1.5, 3.0))
+                -- FIX 4: advance to QUESTING state if AutoQuest is on,
+                -- otherwise skip straight back to LOBBY.
+                DungeonState = Flags.AutoQuest and "QUESTING" or "LOBBY"
+
+            -- ── QUESTING ──────────────────────────────────────
+            -- FIX 4: QUESTING state — previously missing entirely.
+            -- Teleports to the quest NPC in the lobby, fires turn-in
+            -- and request-new calls, then returns to LOBBY.
+            elseif DungeonState == "QUESTING" then
+
+                if HRP and LobbyFolder then
+                    -- Attempt to navigate to the quest giver
+                    local qg   = LobbyFolder:FindFirstChild("QuestGiver")
+                    local base = qg and qg:FindFirstChildWhichIsA("BasePart")
+                    if base then
+                        HRP.CFrame = CFrame.new(base.Position + Vector3.new(0,5,0))
+                        task.wait(rnd(0.4, 0.7))
+                    end
+                end
+
+                doAutoQuest()
+                task.wait(rnd(0.5, 1.0))
                 DungeonState = "LOBBY"
 
             end
@@ -975,14 +1125,29 @@ local PlrESPObjs  = {}
 local LootESPObjs = {}
 local ChamsObjs   = {}
 
-local POOL_SIZE = 80
+-- FIX 8: pool size increased from 80 to Config.TracerPoolSize (default 200)
+-- to handle high ESPMaxDist values without silently clipping entries.
+-- FIX 10: wrapped in pcall. Under Xeno's CoreGui-corescript execution model,
+-- an unprotected top-level Drawing error surfaces as a "CoreGui.XXX" error
+-- and kills the script before Rayfield loads. If Drawing fails we disable
+-- Tracers gracefully rather than crashing the entire script.
+local POOL_SIZE = Config.TracerPoolSize
 local TrPool    = {}
 local activeTr  = 0
+local drawingOk = false
 
-for i = 1, POOL_SIZE do
-    local l = Drawing.new("Line")
-    l.Thickness = 1; l.Transparency = 0.5; l.Visible = false
-    TrPool[i] = l
+pcall(function()
+    for i = 1, POOL_SIZE do
+        local l = Drawing.new("Line")
+        l.Thickness = 1; l.Transparency = 0.5; l.Visible = false
+        TrPool[i] = l
+    end
+    drawingOk = true
+end)
+
+if not drawingOk then
+    warn("[ENI] Drawing API unavailable — Tracers disabled.")
+    Flags.Tracers = false
 end
 
 local function clearTr()
@@ -1034,7 +1199,9 @@ local function addMobESP(model)
     local dl = Instance.new("TextLabel")
     dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
     dl.TextColor3=Color3.fromRGB(255,200,200); dl.TextStrokeTransparency=0
-    dl.TextScaled=true; dl.Font=Enum.Font.Gotham; dl.Parent=bb
+    dl.TextScaled=true; dl.Font=Enum.Font.Gotham
+    dl.Text = ""   -- FIX 7: initialize to empty string to prevent blank flash on spawn
+    dl.Parent=bb
     MobESPObjs[model] = {bb=bb,lbl=lbl,dl=dl}
     model.AncestryChanged:Connect(function()
         if not model:IsDescendantOf(game) then cleanESP(MobESPObjs, model) end
@@ -1051,7 +1218,9 @@ local function addPlayerESP(p)
     local dl = Instance.new("TextLabel")
     dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
     dl.TextColor3=Color3.fromRGB(180,230,255); dl.TextStrokeTransparency=0
-    dl.TextScaled=true; dl.Font=Enum.Font.Gotham; dl.Parent=bb
+    dl.TextScaled=true; dl.Font=Enum.Font.Gotham
+    dl.Text = ""   -- FIX 7: initialize to empty string to prevent blank flash on spawn
+    dl.Parent=bb
     PlrESPObjs[p] = {bb=bb,lbl=lbl,dl=dl}
     p.CharacterRemoving:Connect(function() cleanESP(PlrESPObjs, p) end)
 end
@@ -1223,7 +1392,7 @@ if not ok or not Rayfield then warn("[ENI] Rayfield failed."); return end
 local W = Rayfield:CreateWindow({
     Name = "Solo Hunters — ENI Build",
     LoadingTitle    = "Solo Hunters",
-    LoadingSubtitle = "ENI Build v6.0",
+    LoadingSubtitle = "ENI Build v6.2",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false,
 })
@@ -1341,7 +1510,7 @@ FarmTab:CreateButton({
                 })
                 enterPortal(portal)
             else
-                Rayfield:Notify({ Title="Portal", Content="No portals found.", Duration=3 })
+                Rayfield:Notify({ Title="Portal", Content="No portals found or all out of reach.", Duration=3 })
             end
         end)
     end,
@@ -1361,8 +1530,13 @@ FarmTab:CreateToggle({
 })
 
 FarmTab:CreateButton({
+    -- FIX 2: manual button resets the session guard so the user can
+    -- force a re-fire without reloading the entire script.
     Name = "Redeem Codes Now",
-    Callback = function() task.spawn(doRedeemCodes) end,
+    Callback = function()
+        codesRedeemedThisSession = false
+        task.spawn(function() doRedeemCodes(true) end)
+    end,
 })
 
 FarmTab:CreateToggle({
@@ -1806,7 +1980,7 @@ MiscTab:CreateKeybind({
 -- READY
 -- ════════════════════════════════════════════════════════════
 Rayfield:Notify({
-    Title   = "ENI Build v6.0",
+    Title   = "ENI Build v6.2",
     Content = "Solo Hunters loaded  |  RightShift = toggle UI",
     Duration = 5,
 })
