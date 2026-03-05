@@ -600,12 +600,41 @@ local function getNearestMob(maxD)
 end
 
 -- ════════════════════════════════════════════════════════════
--- SECTION 10: WEAPON HANDLE
+-- SECTION 10: WEAPON HITBOX RESOLUTION
+--
+-- Root cause of the old kill-aura failing silently:
+--   getHandle() returned the tool's Handle (MeshPart / visual
+--   geometry). The server validates damage touches against the
+--   weapon's SlashHitbox part specifically — not the Handle.
+--   Firing firetouchinterest from Handle produced zero server-
+--   side damage regardless of character position.
+--
+-- Fix: getSlashHitbox() searches the equipped tool for a part
+-- named SlashHitbox (confirmed present in Structure.txt across
+-- every weapon). Falls back to Handle, then HRP as last resort.
+--
+-- No-proximity kill:
+--   Because the local client owns its own character parts,
+--   CFrame assignments to SlashHitbox replicate to the server.
+--   attackEntry() teleports SlashHitbox onto each mob's HRP
+--   before firing firetouchinterest, so the server sees a
+--   genuine spatial overlap — no character movement required.
 -- ════════════════════════════════════════════════════════════
-local function getHandle()
+
+local function getSlashHitbox()
     if not Char then return HRP end
     for _, item in ipairs(Char:GetChildren()) do
         if item:IsA("Tool") then
+            -- Primary: SlashHitbox is the validated damage part
+            local sh = item:FindFirstChild("SlashHitbox", true)
+            if sh and sh:IsA("BasePart") then return sh end
+            -- Fallback: any hitbox-named part
+            for _, d in ipairs(item:GetDescendants()) do
+                if d:IsA("BasePart") and d.Name:lower():find("hitbox") then
+                    return d
+                end
+            end
+            -- Last resort: Handle or any BasePart in the tool
             return item:FindFirstChild("Handle")
                 or item:FindFirstChildWhichIsA("BasePart")
                 or HRP
@@ -615,20 +644,52 @@ local function getHandle()
 end
 
 -- ════════════════════════════════════════════════════════════
--- SECTION 11: ATTACK
--- firetouchinterest begin → yield → firetouchinterest end
--- TakeDamage removed (v7 LOGIC-3): client-side, server-filtered.
+-- SECTION 11: ATTACK  (proximity-free, hitbox-teleport method)
+--
+-- Execution order per mob:
+--   1. Resolve SlashHitbox from equipped tool.
+--   2. CFrame SlashHitbox directly onto mob's HRP.
+--      (Client authority over own character parts means this
+--       replicates to the server — server sees the overlap.)
+--   3. firetouchinterest(hitbox, mobPart, 1) — touch begin.
+--   4. task.wait() — one frame for server to process.
+--   5. Nil-check mob (may have died in that frame).
+--   6. firetouchinterest(hitbox, mobPart, 0) — touch end.
+--
+-- The character does not need to be anywhere near the mob.
 -- ════════════════════════════════════════════════════════════
 local function attackEntry(e)
     if not inWS(e.model) or e.hum.Health <= 0 then return end
-    local h = getHandle(); if not h then return end
-    for _, p in ipairs(e.parts) do
-        if p and p.Parent then pcall(firetouchinterest, h, p, 1) end
+
+    local hitbox = getSlashHitbox()
+    if not hitbox then return end
+
+    -- Teleport the hitbox onto the mob's HumanoidRootPart.
+    -- This is the no-proximity mechanism: we bring the hitbox
+    -- to the mob rather than the character.
+    if hitbox ~= HRP then
+        pcall(function()
+            hitbox.CFrame = e.hrp.CFrame
+        end)
     end
-    task.wait()
-    if not inWS(e.model) or e.hum.Health <= 0 then return end
+
+    -- Touch begin — server registers the overlap
     for _, p in ipairs(e.parts) do
-        if p and p.Parent then pcall(firetouchinterest, h, p, 0) end
+        if p and p.Parent then
+            pcall(firetouchinterest, hitbox, p, 1)
+        end
+    end
+
+    task.wait()  -- one frame
+
+    -- Re-validate: mob may have died during the yield
+    if not inWS(e.model) or e.hum.Health <= 0 then return end
+
+    -- Touch end — completes the damage cycle
+    for _, p in ipairs(e.parts) do
+        if p and p.Parent then
+            pcall(firetouchinterest, hitbox, p, 0)
+        end
     end
 end
 
@@ -1782,6 +1843,12 @@ local W = Rayfield:CreateWindow({
 -- SECTION 27: KILL AURA & AUTO SKILLS
 -- ARCH-1 (retained): spawned AFTER Rayfield window creation.
 -- Handles stored in getgenv() registry for cross-execution cancel.
+--
+-- Kill Aura radius config is preserved for the UI slider but
+-- getMobs() is called with nil — ALL mobs in the cache are
+-- targeted regardless of distance. attackEntry() teleports the
+-- SlashHitbox to each mob so the character never needs to move.
+-- The radius slider now controls ESP/Tracer filtering only.
 -- ════════════════════════════════════════════════════════════
 local killAuraThread   = nil
 local autoSkillsThread = nil
@@ -1789,9 +1856,11 @@ local autoSkillsThread = nil
 killAuraThread = task.spawn(function()
     while true do
         task.wait(rnd(0.15, 0.28))
-        if Flags.KillAura and HRP and Hum and Hum.Health > 0 then
-            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do
-                attackEntry(e)
+        if Flags.KillAura and Hum and Hum.Health > 0 then
+            for _, e in ipairs(getMobs()) do  -- nil = all mobs, no radius cap
+                if e.hum.Health > 0 then
+                    attackEntry(e)
+                end
             end
         end
     end
@@ -1962,7 +2031,9 @@ CombTab:CreateToggle({
 })
 
 CombTab:CreateSlider({
-    Name = "Kill Aura Radius",
+    -- Radius now controls ESP/Tracer display range only.
+    -- Kill Aura targets ALL mobs regardless of distance.
+    Name = "ESP / Tracer Radius  (kill range is unlimited)",
     Range = {10, 600}, Increment = 10, Suffix = " studs",
     CurrentValue = 80, Flag = "AuraRadius",
     Callback = function(v) Config.KillAuraRadius = v end,
@@ -1971,16 +2042,20 @@ CombTab:CreateSlider({
 CombTab:CreateButton({
     Name = "Kill Nearest Mob",
     Callback = function()
-        local e = getNearestMob(1000)
+        -- getNearestMob used only to select the target —
+        -- attackEntry handles the hitbox teleport, no movement.
+        local e = getNearestMob(math.huge)
         if e then task.spawn(attackEntry, e) end
     end,
 })
 
 CombTab:CreateButton({
-    Name = "Kill All In Aura Range",
+    Name = "Kill All Mobs Now  (unlimited range)",
     Callback = function()
         task.spawn(function()
-            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do attackEntry(e) end
+            for _, e in ipairs(getMobs()) do  -- no radius cap
+                if e.hum.Health > 0 then attackEntry(e) end
+            end
         end)
     end,
 })
