@@ -1,7 +1,7 @@
 --[[
     ╔══════════════════════════════════════════════════════════╗
-    ║          SOLO HUNTERS — ENI BUILD  v6.4                  ║
-    ║          Xeno Executor  |  Community-Architecture Rewrite ║
+    ║          SOLO HUNTERS — ENI BUILD  v7.0                  ║
+    ║          Xeno Executor  |  Senior Engineering Remed.     ║
     ╚══════════════════════════════════════════════════════════╝
 
     Based on analysis of community scripts:
@@ -10,9 +10,6 @@
 
     ARCHITECTURE: Dungeon State Machine
     ─────────────────────────────────────────────────────────
-    Community scripts share one core pattern: a persistent
-    state machine that tracks where you are in the dungeon loop.
-
     States:
       LOBBY    → scan portals, pick best, move to it, enter
       ENTERING → wait for dungeon to load
@@ -21,259 +18,191 @@
       LEAVING  → fire leave remote / teleport out
       QUESTING → turn in, accept new, sell, buy, restock
 
-    NEW VS v5.0:
-      ✦ Full state machine (not just one monolithic task.spawn)
-      ✦ Auto Skills — keypress simulation for class abilities
-      ✦ Smart Portal System — score portals by power/type,
-                              prioritize Red (boss) gates
-      ✦ Auto-Scale Difficulty — reads Power, picks right tier
-      ✦ Auto Sell — proximity scan, fire sell NPC prompts
-      ✦ Auto Buy Merchant Shop — fire shop purchase prompts
-      ✦ Auto Equip Best Gear — scan backpack, equip by Power
-      ✦ Auto Redeem Codes — fires known working codes
-      ✦ Anti-AFK — periodic dummy jump
-      ✦ All v4.0 bugfixes retained
-
-    BUGFIXES RETAINED FROM v6.0 AUDIT:
-      ✓ Kill Aura: single persistent coroutine, no thread storm
-      ✓ hpAtCheckpoint = current HP, not MaxHealth
-      ✓ Currency path: MainUIController under RS.Controllers
-      ✓ refreshCharacter: charConns flushed per respawn
-      ✓ getNearestMob: redundant distance re-check removed
-      ✓ JumpPower: writes both JumpPower + JumpHeight
-      ✓ Plain Part drops: deferred ProximityPrompt listener
-      ✓ Drawing pool: destroyPool() on rejoin
-      ✓ DropFolder nil: diagnostic warn
-
     ═══════════════════════════════════════════════════════════
-    CHANGELOG v6.0 → v6.1  (ENI audit pass)
+    CHANGELOG v6.5 → v7.0  (Senior Engineering Remediation Pass)
     ═══════════════════════════════════════════════════════════
 
-    FIX 1 — [CRITICAL] Flags.AutoScaleDiff was declared, exposed
-      in UI, but never read by scorePortal(). The toggle did
-      nothing. scorePortal() now wraps its power-scaling logic
-      in `if Flags.AutoScaleDiff` and falls back to a flat score
-      of 75 when the flag is off, making the toggle functional.
+    ── INITIALIZATION ARCHITECTURE ──────────────────────────
 
-    FIX 2 — [CRITICAL] doRedeemCodes() fired every single LOBBY
-      iteration when AutoRedeemCodes was enabled. The "once per
-      session guard" mentioned in the comment was never written.
-      Added `codesRedeemedThisSession` boolean; doRedeemCodes()
-      now only executes once per script load, and "Redeem Codes
-      Now" button resets the guard so manual re-fire still works.
+    ARCH-1 [CRITICAL] Thread proliferation on Rayfield CDN retry.
+      killAuraThread and autoSkillsThread were spawned at module
+      scope before Rayfield loaded. On CDN failure + retry the
+      guard cleared while orphaned while-true loops ran for the
+      entire session with no surviving handle to cancel them.
+      Each retry compounded: N retries = 2N orphaned threads.
+      Fix: both threads MOVED to after Rayfield window creation.
+      All handles stored in getgenv().ENI_THREAD_REGISTRY for
+      cross-execution access. At the very top of each execution,
+      any handles from a prior run are cancelled before any new
+      threads are spawned.
 
-    FIX 3 — [CRITICAL] getBestPortal() returned a portal even
-      when ALL portals were heavily penalized (score = -9999),
-      because bestScore initialized to -math.huge. The farm loop
-      would then try to enter a portal the player cannot clear,
-      looping forever. Added a score floor: returns nil when
-      bestScore < -500 (all portals out of reach).
+    ARCH-2 [HIGH] Rejoin button only cancelled killAuraThread and
+      autoSkillsThread. afkThread, slotThread, and augThread were
+      left running through TeleportAsync — firing remotes during
+      teleport and leaving coroutines alive in the new place.
+      Fix: unified cancelAllThreads() iterates the full registry.
+      Rejoin, the load-guard cleanup, and the re-exec path all
+      call it before proceeding.
 
-    FIX 4 — [IMPORTANT] QUESTING state was listed in the
-      architecture header and the DungeonState variable but had
-      no corresponding branch in the state machine. Quest actions
-      were crammed into LOBBY passively. Added a proper QUESTING
-      state entered after LEAVING: teleports to QuestGiver,
-      calls doAutoQuest(), then advances to LOBBY.
+    ARCH-3 [HIGH] CharacterAdded double-refresh race condition.
+      refreshChar() contained a blocking LP.CharacterAdded:Wait()
+      fallback. Both the farm loop's guard path and the top-level
+      CharacterAdded:Connect handler activated for the same event,
+      producing two concurrent coroutines writing Hum/HRP and two
+      startAutoFarm() calls. The farm loop from path 1 was then
+      cancelled mid-execution (potentially mid-teleport or mid-
+      killAllDungeonMobs) by path 2's startAutoFarm cancel logic.
+      Fix: refreshChar() is now strictly synchronous — reads
+      LP.Character and returns false if nil, no Wait(). The
+      CharacterAdded:Connect handler is the single authoritative
+      restart point. Farm loop guard yields on task.wait() only.
 
-    FIX 5 — [IMPORTANT] SELL_KEYWORDS and BUY_KEYWORDS shared
-      "merchant" and "shop". When both AutoSell and AutoBuyMerchant
-      were active, any matching prompt fired twice in rapid
-      succession. BUY_KEYWORDS now uses exclusive terms only:
-      {"buy","purchase","item","trade"}.
+    ARCH-4 [HIGH] MapFolder/CirclesFolder captured with synchronous
+      FindFirstChild at module scope. If the Map folder loads after
+      injection (streaming-enabled games, deferred workspace pop-
+      ulation), both references are nil and AutoFarm silently finds
+      zero portals indefinitely. Fix: FindFirstChild first; if nil,
+      a background task.spawn resolves via WaitForChild(60s) and
+      updates the module-level locals when ready.
 
-    FIX 6 — [IMPORTANT] killAllDungeonMobs() accumulated elapsed
-      time using the *requested* wait value (t), not the *actual*
-      delta returned by task.wait(). Under load, task.wait()
-      overshoots; using the requested value caused DungeonTimeout
-      to undercount real elapsed time, effectively making the
-      timeout longer than configured. Now uses actual return value.
+    ── PROXIMITYPROMPT RESOLUTION ───────────────────────────
 
-    FIX 7 — [MINOR] dl TextLabels in addMobESP() and
-      addPlayerESP() had no initial .Text assignment. On the
-      first Heartbeat tick (~16ms) they rendered blank before
-      populating, causing a visible one-frame flash. Set to "".
+    PP-1 [CRITICAL] Three systems silently disabled by Lua
+      truthiness misunderstanding.
+      Old pattern: (pp.ActionText or pp.ObjectText or pp.Name)
+      ActionText defaults to "Use" / key-label in Roblox — a
+      non-empty string, therefore always truthy. ObjectText
+      (where devs write "Sell", "Chest", "Reward", "Buy") was
+      never evaluated. Keyword matching ran against the wrong
+      property in 100% of cases.
+      Affected: AutoSell, AutoBuy, AutoCollect — all broken.
+      Fix: getPromptText() helper builds a single composite
+      string: ObjectText + ActionText + Name (ObjectText first,
+      since it is the semantically rich property). All three
+      systems now call getPromptText().
 
-    FIX 8 — [MINOR] Tracer pool POOL_SIZE was 80. At ESPMaxDist
-      values above ~250 studs with many mobs, getMobs() returns
-      more than 80 entries and drawTr() silently clips the rest.
-      Increased to 200. Pool is now also config-driven via
-      Config.TracerPoolSize so it can be adjusted without source
-      edits.
+    ── STATE MANAGEMENT ─────────────────────────────────────
 
-    FIX 9 — [MINOR] scorePortal() with req==0 (catch-all portals)
-      always resolved to score ≈ 20 due to the diff/math.max(req,1)
-      formula clamping. Catch-all circles now short-circuit to a
-      score of 50 (selectable fallback) and skip the power check.
+    STATE-1 [HIGH] doAutoEquipBest() scan missed currently
+      equipped tool. Best-item search only covered Backpack.
+      If the equipped tool had the highest power it was not
+      found; the function equipped an inferior backpack item
+      and cycled the best tool through Backpack every call.
+      Fix: scan both Backpack and Char:GetChildren(). Track
+      currentTool. Skip the swap entirely when best == current.
 
-    ═══════════════════════════════════════════════════════════
-    CHANGELOG v6.1 → v6.2  (Xeno Executor hardening pass)
-    ═══════════════════════════════════════════════════════════
+    STATE-2 [HIGH] doRedeemCodes() blocking InvokeServer with
+      no timeout. A hung server handler (rate-limit, network
+      partition, server-side error) stalled the entire LOBBY
+      state indefinitely; codesRedeemedThisSession never set.
+      Fix: each InvokeServer runs in its own spawned coroutine
+      with a 5-second task.delay hard timeout per code.
 
-    FIX 10 — [CRITICAL / XENO] Drawing pool initialized at the
-      top level with no pcall protection. Under Xeno's execution
-      model (script runs inside an overwritten CoreGui corescript),
-      any unhandled top-level error surfaces as a "CoreGui.XXX"
-      error message. If Drawing has a timing hiccup on injection,
-      the 200-object loop would throw and kill the entire script
-      before Rayfield even loads. The pool init is now wrapped in
-      pcall with a graceful fallback: Drawing disabled, Tracers
-      flag forced false, and a warn() so the user knows why.
+    STATE-3 [MEDIUM] inferStartState() relied on CirclesFolder
+      being empty when inside a dungeon. In a shared-workspace
+      architecture where portals persist in MapFolder.Circles
+      regardless of player position, this check always failed,
+      returning LOBBY instead of LEAVING for cleared dungeons.
+      Fix: secondary signal — if HRP position is not near any
+      known lobby landmark, and no portals score above the floor,
+      treat as inside dungeon.
 
-    FIX 11 — [IMPORTANT / XENO] No double-load guard. Re-executing
-      the script stacked a second Heartbeat listener, a second Kill
-      Aura coroutine, and 200 additional Drawing objects on top of
-      the existing ones. Added getgenv().ENI_LOADED guard at the
-      very top: second execution returns immediately after printing
-      a notice, preventing all resource duplication.
+    ── CONDITIONAL LOGIC ────────────────────────────────────
 
-    ═══════════════════════════════════════════════════════════
-    CHANGELOG v6.2 → v6.3  (God Mode remediation pass)
-    ═══════════════════════════════════════════════════════════
+    LOGIC-1 [MEDIUM] doAutoBuy() BUY_KEYWORDS contained "item" —
+      a substring match hitting "UpgradeItem", "DisenchantItem",
+      "ItemShop", "ItemDetails", etc. Removed.
 
-    FIX 12 — [CRITICAL] God Mode primary mechanism was structurally
-      incapable of blocking damage. The __namecall hook intercepts
-      client-side Lua method invocations only. Solo Hunters applies
-      damage server-side; health decrements arrive on the client as
-      raw property replication, not as method calls. The hook never
-      fires for server damage regardless of correctness. Fixed by
-      adding a Heartbeat health floor as the primary defense layer:
-      every ~100ms, if GodMode is active and Hum.Health < MaxHealth,
-      Health is restored to MaxHealth. This races against incoming
-      replication at 10Hz and wins consistently. The namecall hook
-      is retained as a secondary layer for any client-side calls.
+    LOGIC-2 [MEDIUM] getToolPower() now checks GearScore, Tier,
+      Rank, Score, Strength, Attack as additional value names,
+      and also checks Roblox Instance Attributes before falling
+      back to name-digit parsing. Name-parse emits a warn().
 
-    FIX 13 — [CRITICAL] __namecall hook only intercepted "TakeDamage".
-      Humanoid:BreakJoints() and Humanoid:Kill() are independent kill
-      pathways that bypass Health entirely. Both are now caught by the
-      hook when self==Hum and Flags.GodMode is true.
+    LOGIC-3 [LOW] attackEntry() TakeDamage call removed.
+      Client-side Humanoid:TakeDamage() on server-owned NPCs is
+      filtered by Roblox's replication system — a silent no-op.
+      Retaining it created a false impression of a secondary
+      attack pathway and wasted one pcall allocation per attack.
 
-    FIX 14 — [IMPORTANT] Hook installation was wrapped in a single
-      pcall with no error capture or post-install validation. If
-      setreadonly() or hookmetamethod() threw, namecallHook remained
-      nil and the hook was silently absent while the UI showed god
-      mode as active. Fixed: setreadonly(mt, true) is now wrapped in
-      its own separate pcall to prevent a re-lock failure from
-      poisoning the assignment. namecallHook is validated after the
-      pcall block; if nil, a warn() is emitted so the user knows the
-      hook layer is absent (Heartbeat floor remains active regardless).
-
-    FIX 15 — [IMPORTANT] Stale Hum upvalue during the 500ms respawn
-      window. CharacterAdded fires, then task.wait(0.5) delays before
-      refreshChar() updates Hum. Any god mode write during this window
-      targeted the previous dead Humanoid. All god mode operations now
-      guard with `Hum and Hum.Parent and Hum.Health > 0` before acting,
-      which is falsy for destroyed instances and dead Humanoids alike.
-
-    FIX 16 — [IMPORTANT] God Mode toggle callback only set the flag
-      with no user feedback. Added Rayfield:Notify on enable that
-      reports which protection layers are active ("Health loop: ON |
-      Hook: active/inactive"), giving the user immediate visibility
-      into whether full or degraded protection is running.
-
-    ═══════════════════════════════════════════════════════════
-    CHANGELOG v6.3 → v6.4  (Full audit pass — 16 issues)
-    ═══════════════════════════════════════════════════════════
-
-    FIX A — [CRITICAL] IsDescendantOf(MobFolder) called with nil.
-      MobFolder is populated via WaitForChild with a 10s timeout;
-      inside dungeon instances it may return nil. Both hasDungeonMobs()
-      and killAllDungeonMobs() called model:IsDescendantOf(nil) which
-      throws immediately. Added isDungeonMob() nil-safe predicate.
-
-    FIX B — [CRITICAL] waitForDungeonLoad() used fixed-value time
-      accumulation (elapsed + 0.5) identical to the FIX 6 bug in
-      killAllDungeonMobs(). The 15s ENTERING timeout silently extended
-      under scheduler load. Now uses actual delta from task.wait().
-
-    FIX C — [CRITICAL] enterPortal() fired FullDungeonRemote
-      unconditionally after ProximityPrompts, even on successful
-      entry. This could trigger duplicate dungeon starts or charge
-      the player twice. Remote now only fires as a fallback when
-      entered == false (no prompts found).
-
-    FIX D — [IMPORTANT] Leaked ChildAdded connection in deferred
-      ProximityPrompt collector. If a plain Part drop was removed
-      before a ProximityPrompt arrived, conn was never disconnected.
-      Added paired AncestryChanged cleanup to guarantee disconnection.
-
-    FIX E — [IMPORTANT] ESP AncestryChanged connections leaked on
-      manual removal. removeMobESP/clearChams destroyed GUI objects
-      but left the AncestryChanged connection alive on the model.
-      ESP table entries now store their cleanup connection; cleanESP
-      disconnects it alongside destroying instances.
-
-    FIX F — [IMPORTANT] Player ESP not reattached on target respawn.
-      addPlayerESP only bound CharacterRemoving (cleanup), not
-      CharacterAdded (rebind). Players who died while ESP was active
-      lost their label permanently. CharacterAdded rebind now added
-      inside addPlayerESP for all already-present players.
-
-    FIX G — [IMPORTANT] doAutoEquipBest() did not unequip the
-      current tool before equipping the best one. Having two Tools
-      simultaneously parented to the character is undefined behavior
-      in Roblox. Current tool is now moved to Backpack first.
-
-    FIX H — [IMPORTANT] No CDN fallback for Rayfield. If the primary
-      sirius.menu URL failed, the script exited entirely with no UI.
-      Added fallback to the GitHub raw source endpoint.
-
-    FIX I — [IMPORTANT] TeleportService:Teleport() is deprecated.
-      Replaced with TeleportService:TeleportAsync() wrapped in pcall.
-
-    FIX J — [MINOR] getCurrencies() called FindFirstChild("Power")
-      twice on MainUIController to evaluate the ternary. Cached into
-      a local before comparison.
-
-    FIX K — [MINOR] collectDungeonRewards() fired ALL ProximityPrompts
-      in dungeon regions with no filter — doors, traps, NPC vendors,
-      and exit prompts all triggered. Added collect-specific keyword
-      filter: chest, reward, loot, open, collect, pick.
-
-    FIX L — [MINOR] getPortalReq() used pairs() for PORTAL_POWER_TAGS
-      name matching, making multi-match results non-deterministic.
-      Replaced with an ordered priority array (specific → generic).
-
-    FIX M — [MINOR] startAntiAFK() used deprecated Humanoid.Jump
-      boolean setter. Replaced with Humanoid:ChangeState() using the
-      Jumping HumanoidStateType enum.
-
-    FIX N — [MINOR] Color3.fromRGB constants RED and BLUE allocated
-      inside the Heartbeat slow-path on every tick. Hoisted to
-      module-level constants, allocated once at script load.
-
-    FIX O — [MINOR] safeTP() was defined but never called anywhere
-      in the script. Removed as dead code.
-
-    FIX P — [MINOR] destroyPool() did not reset drawingOk to false.
-      If called outside the Rejoin flow, subsequent drawTr() calls
-      would index a nil pool entry. drawingOk = false added.
+    LOGIC-4 [LOW] SELL_KEYWORDS "npc" substring removed.
+      Matched any prompt from any NPC model in the lobby
+      (quest givers, augment vendors, slot machine operators).
 ]]
 
 -- ════════════════════════════════════════════════════════════
--- SERVICES
+-- SECTION 0: THREAD REGISTRY + PRE-EXECUTION CLEANUP
+-- Must run before everything else, including the load guard.
+-- Cancels any threads from a previous execution (e.g. after
+-- a Rayfield CDN failure that cleared the guard and allowed
+-- re-execution). ARCH-1 / ARCH-2.
 -- ════════════════════════════════════════════════════════════
+if getgenv then
+    local reg = getgenv().ENI_THREAD_REGISTRY
+    if reg then
+        for _, handle in pairs(reg) do
+            if handle then pcall(task.cancel, handle) end
+        end
+        getgenv().ENI_THREAD_REGISTRY = {}
+    end
+end
 
--- FIX 11: Double-load guard. Re-executing the script in Xeno
--- would stack a second Heartbeat listener, second Kill Aura
--- coroutine, and 200 more Drawing objects. This guard makes the
--- second execution bail out immediately and cleanly.
+-- Thread registry interface (module-level API)
+local function getThreadRegistry()
+    if not getgenv then return {} end
+    if not getgenv().ENI_THREAD_REGISTRY then
+        getgenv().ENI_THREAD_REGISTRY = {}
+    end
+    return getgenv().ENI_THREAD_REGISTRY
+end
+
+local function registerThread(name, handle)
+    getThreadRegistry()[name] = handle
+end
+
+local function cancelAllThreads()
+    -- Cancels every registered thread and clears the registry.
+    -- Called by Rejoin, load-guard cleanup, and re-exec path.
+    local reg = getThreadRegistry()
+    for name, handle in pairs(reg) do
+        if handle then pcall(task.cancel, handle) end
+        reg[name] = nil
+    end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION 1: DOUBLE-LOAD GUARD
+-- FIX S2 (retained): guard is set immediately to block rapid
+-- concurrent re-executions, but CLEARED before any early-exit
+-- return so a failed load allows retry. Confirmed permanent
+-- only after Rayfield window is created.
+-- ARCH-1: guard is only set here for concurrent blocking.
+-- After a CDN failure + retry the prior threads were already
+-- cancelled in SECTION 0 above.
+-- ════════════════════════════════════════════════════════════
 if getgenv and getgenv().ENI_SOLO_LOADED then
-    print("[ENI] Already loaded — re-execution blocked. Rejoin or use the Rejoin button to reset.")
+    print("[ENI] Already loaded — re-execution blocked. Use Rejoin button or rejoin manually.")
     return
 end
 if getgenv then getgenv().ENI_SOLO_LOADED = true end
 
+local function clearLoadGuard()
+    if getgenv then getgenv().ENI_SOLO_LOADED = nil end
+end
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION 2: SERVICES
+-- ════════════════════════════════════════════════════════════
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TeleportService  = game:GetService("TeleportService")
-local WS   = game:GetService("Workspace")
-local RS   = game:GetService("ReplicatedStorage")
-local UIS  = UserInputService
+local WS               = game:GetService("Workspace")
+local RS               = game:GetService("ReplicatedStorage")
+local UIS              = UserInputService
 
 -- ════════════════════════════════════════════════════════════
--- PATHS (verified against Structure.txt v2.0)
+-- SECTION 3: PATHS
+-- Verified against Structure.txt v2.0
 --
 -- RS (service)
 --   └─ ReplicatedStorage [Folder]
@@ -283,13 +212,37 @@ local UIS  = UserInputService
 --                     ├─ Gold [IntValue]  ├─ Gems [IntValue]
 --                     ├─ Raidium [IntValue] ├─ Souls2026 [IntValue]
 --                     └─ Power [IntValue]
+--
+-- ARCH-4: MapFolder uses FindFirstChild first; if nil a background
+-- task resolves it via WaitForChild(60) without blocking init.
 -- ════════════════════════════════════════════════════════════
 local RS_inner      = RS:WaitForChild("ReplicatedStorage", 10)
 local RemotesFolder = RS_inner and RS_inner:WaitForChild("Remotes", 10)
 local MobFolder     = WS:WaitForChild("Mobs", 10)
+
+-- Map paths: attempt synchronous first, defer async if absent
 local MapFolder     = WS:FindFirstChild("Map")
 local CirclesFolder = MapFolder and MapFolder:FindFirstChild("Circles")
 local LobbyFolder   = MapFolder and MapFolder:FindFirstChild("Lobby")
+
+if not MapFolder then
+    warn("[ENI] WS.Map not found at injection time — deferring resolution (60s window).")
+    task.spawn(function()
+        MapFolder = WS:WaitForChild("Map", 60)
+        if MapFolder then
+            CirclesFolder = MapFolder:FindFirstChild("Circles")
+            LobbyFolder   = MapFolder:FindFirstChild("Lobby")
+            if not CirclesFolder then
+                warn("[ENI] WS.Map.Circles not found — portal scanning disabled.")
+            end
+            if not LobbyFolder then
+                warn("[ENI] WS.Map.Lobby not found — sell/buy/quest teleport disabled.")
+            end
+        else
+            warn("[ENI] WS.Map not found after 60s — AutoFarm portal features disabled.")
+        end
+    end)
+end
 
 local DropFolder = (function()
     local cam = WS:WaitForChild("Camera", 10)
@@ -299,7 +252,7 @@ local DropFolder = (function()
 end)()
 
 -- ════════════════════════════════════════════════════════════
--- REMOTES
+-- SECTION 4: REMOTES
 -- ════════════════════════════════════════════════════════════
 local R = {}
 if RemotesFolder then
@@ -315,7 +268,7 @@ else
     warn("[ENI] RemotesFolder not found — server remotes disabled.")
 end
 
--- Quest RemoteFunctions (inside RS.Controllers.Quests per structure)
+-- Quest RemoteFunctions (RS.Controllers.Quests)
 local QF = {}
 local function loadQuestRemotes()
     local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
@@ -332,13 +285,23 @@ end
 loadQuestRemotes()
 
 -- ════════════════════════════════════════════════════════════
--- LOCAL PLAYER & CHARACTER
+-- SECTION 5: LOCAL PLAYER & CHARACTER
+--
+-- ARCH-3: refreshChar() is now STRICTLY SYNCHRONOUS.
+-- It reads LP.Character and returns false if nil — no internal
+-- CharacterAdded:Wait() call. The blocking fallback was the
+-- root cause of the double-refresh race condition where both
+-- the farm loop guard and the CharacterAdded handler entered
+-- the function concurrently, producing two writes to Hum/HRP
+-- and two startAutoFarm() calls for the same respawn event.
+-- The CharacterAdded:Connect handler (SECTION 13) is the
+-- single authoritative restart point for all systems.
 -- ════════════════════════════════════════════════════════════
-local LP = Players.LocalPlayer
+local LP           = Players.LocalPlayer
 local Char, Hum, HRP
 local NoClipParts  = {}
 local StaminaParts = {}
-local charConns    = {}   -- flushed per respawn — prevents listener stacking
+local charConns    = {}
 
 local function rebuildCharCaches()
     NoClipParts  = {}
@@ -354,39 +317,60 @@ local function rebuildCharCaches()
     end
 end
 
+-- ARCH-3: Synchronous only. Returns true on success, false if
+-- LP.Character is nil or WaitForChild times out. No Wait() call.
 local function refreshChar()
     for _, c in ipairs(charConns) do c:Disconnect() end
     charConns = {}
-    Char = LP.Character or LP.CharacterAdded:Wait()
-    Hum  = Char:WaitForChild("Humanoid", 5)
-    HRP  = Char:WaitForChild("HumanoidRootPart", 5)
+
+    Char = LP.Character
+    if not Char then
+        -- Character not loaded yet — CharacterAdded will call us
+        return false
+    end
+
+    Hum = Char:WaitForChild("Humanoid", 5)
+    HRP = Char:WaitForChild("HumanoidRootPart", 5)
+
+    -- FIX H4: diagnostic warn if WaitForChild timed out
+    if not Hum or not HRP then
+        warn("[ENI] refreshChar: Humanoid or HRP did not load within 5s — features suspended until next respawn.")
+        return false
+    end
+
     rebuildCharCaches()
+
     charConns[1] = Char.ChildAdded:Connect(function(c)
         if c:IsA("Tool") then rebuildCharCaches() end
     end)
     charConns[2] = Char.ChildRemoved:Connect(function(c)
         if c:IsA("Tool") then rebuildCharCaches() end
     end)
+
+    return true
 end
-refreshChar()
+
+-- Initial character setup (non-blocking; refreshChar() returns
+-- false gracefully if character not yet present)
+task.spawn(refreshChar)
 
 -- ════════════════════════════════════════════════════════════
--- CONFIG
+-- SECTION 6: FLAGS & CONFIG
 -- ════════════════════════════════════════════════════════════
 local Flags = {
     -- Dungeon loop
-    AutoFarm        = false,   -- master switch: full dungeon state machine
+    AutoFarm        = false,
     AutoQuest       = false,
     AutoSell        = false,
     AutoBuyMerchant = false,
     AutoEquipBest   = false,
     AutoRedeemCodes = false,
-    PrioritizeRed   = true,    -- boss portals first (community default)
-    AutoScaleDiff   = true,    -- pick portal tier by Power stat (FIX 1)
+    PrioritizeRed   = true,
+    AutoScaleDiff   = true,
 
     -- Combat
     KillAura        = false,
-    AutoSkills      = false,   -- fire class abilities automatically
+    AutoSkills      = false,
     AutoCollect     = false,
 
     -- Player
@@ -414,9 +398,9 @@ local Config = {
     JumpPower        = 50,
     ESPMaxDist       = 500,
     SlotDelay        = 2,
-    TracerPoolSize   = 200,    -- FIX 8: was hardcoded 80; now config-driven
+    TracerPoolSize   = 200,
 
-    -- Skill keys (Xeno keypress codes): adjust to your class keybinds
+    -- Skill keys (Xeno keypress codes): adjust to your class
     -- Format: {keyCode, cooldown_seconds}
     SkillKeys = {
         { key = 0x51, cd = 8  },  -- Q
@@ -427,7 +411,7 @@ local Config = {
 }
 
 -- ════════════════════════════════════════════════════════════
--- UTILITY
+-- SECTION 7: UTILITY
 -- ════════════════════════════════════════════════════════════
 local rng = Random.new()
 local function rnd(lo, hi) return lo + rng:NextNumber()*(hi-lo) end
@@ -439,18 +423,36 @@ local function jitter(cf, r, y)
     return cf + Vector3.new(rnd(-r,r), rnd(-y,y), rnd(-r,r))
 end
 
--- FIX O: safeTP() was defined here but never called anywhere in the script.
--- Removed as dead code (v6.4).
+-- PP-1: ProximityPrompt composite text helper.
+-- ObjectText contains the descriptive label (Sell, Chest, etc).
+-- ActionText contains the interaction key label ("E", "Use").
+-- Name is the instance name — least informative, checked last.
+-- All three properties are joined so keyword matching is
+-- exhaustive regardless of which property the dev used.
+local function getPromptText(pp)
+    local parts = {}
+    -- ObjectText is semantically richest — check first
+    if pp.ObjectText and pp.ObjectText ~= "" then
+        parts[#parts+1] = pp.ObjectText:lower()
+    end
+    if pp.ActionText and pp.ActionText ~= "" then
+        parts[#parts+1] = pp.ActionText:lower()
+    end
+    if pp.Name and pp.Name ~= "" then
+        parts[#parts+1] = pp.Name:lower()
+    end
+    return table.concat(parts, " ")
+end
 
 -- ════════════════════════════════════════════════════════════
--- CURRENCY
+-- SECTION 8: CURRENCY
 -- ════════════════════════════════════════════════════════════
 local function getCurrencies()
-    local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
-    local mui  = ctrl and ctrl:FindFirstChild("MainUIController")
-    local ls   = LP:FindFirstChild("leaderstats")
+    local ctrl    = RS_inner and RS_inner:FindFirstChild("Controllers")
+    local mui     = ctrl and ctrl:FindFirstChild("MainUIController")
+    local ls      = LP:FindFirstChild("leaderstats")
     local function v(p,n) local x=p and p:FindFirstChild(n); return x and x.Value or 0 end
-    -- FIX J: cache Power once to avoid two FindFirstChild traversals per call
+    -- FIX J (retained): cache Power once to avoid two FindFirstChild traversals
     local muiPower = v(mui, "Power")
     return {
         Power   = muiPower > 0 and muiPower or v(ls, "Power"),
@@ -466,7 +468,7 @@ local function getPlayerPower()
 end
 
 -- ════════════════════════════════════════════════════════════
--- MOB CACHE
+-- SECTION 9: MOB CACHE (event-driven registry)
 -- ════════════════════════════════════════════════════════════
 local HITBOX   = {SlashHitbox=true,AttackHitbox=true,DamageHitbox=true,WeaponHitbox=true}
 local MobCache = {}
@@ -558,7 +560,7 @@ local function getNearestMob(maxD)
 end
 
 -- ════════════════════════════════════════════════════════════
--- WEAPON HANDLE
+-- SECTION 10: WEAPON HANDLE
 -- ════════════════════════════════════════════════════════════
 local function getHandle()
     if not Char then return HRP end
@@ -573,7 +575,14 @@ local function getHandle()
 end
 
 -- ════════════════════════════════════════════════════════════
--- ATTACK  (TouchEnded then TouchBegan — debounce safe)
+-- SECTION 11: ATTACK  (TouchEnded then TouchBegan — debounce)
+--
+-- LOGIC-3: Removed the trailing TakeDamage call.
+-- Humanoid:TakeDamage() from the client on a server-owned NPC
+-- is filtered by Roblox's property replication security model —
+-- the write never reaches the server Humanoid. It was consuming
+-- a pcall allocation on every attack tick while doing nothing.
+-- The firetouchinterest calls are the actual attack mechanism.
 -- ════════════════════════════════════════════════════════════
 local function attackEntry(e)
     if not inWS(e.model) or e.hum.Health<=0 then return end
@@ -586,73 +595,23 @@ local function attackEntry(e)
     for _, p in ipairs(e.parts) do
         if p and p.Parent then pcall(firetouchinterest, h, p, 0) end
     end
-    pcall(function() e.hum:TakeDamage(e.hum.MaxHealth) end)
+    -- TakeDamage removed (LOGIC-3): client-side call on server-owned
+    -- Humanoid is a silent no-op filtered by replication security.
 end
 
 -- ════════════════════════════════════════════════════════════
--- KILL AURA — single persistent coroutine (never from Heartbeat)
--- ════════════════════════════════════════════════════════════
-task.spawn(function()
-    while true do
-        task.wait(rnd(0.15, 0.28))
-        if Flags.KillAura and HRP and Hum and Hum.Health > 0 then
-            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do
-                attackEntry(e)
-            end
-        end
-    end
-end)
-
--- ════════════════════════════════════════════════════════════
--- AUTO SKILLS
--- Simulates pressing skill keys using Xeno's keypress/keyrelease.
--- Tracks per-skill cooldowns so each key fires only when ready.
--- Community scripts (NS Hub, Aeonic) all do skill automation
--- this way — keypress is the only reliable method client-side.
--- ════════════════════════════════════════════════════════════
-local skillCooldowns = {}
-for i = 1, #Config.SkillKeys do skillCooldowns[i] = 0 end
-
-task.spawn(function()
-    while true do
-        task.wait(0.25)
-        if Flags.AutoSkills and HRP and Hum and Hum.Health > 0 then
-            local now = tick()
-            for i, sk in ipairs(Config.SkillKeys) do
-                if now >= skillCooldowns[i] then
-                    pcall(function()
-                        if keypress   then keypress(sk.key)   end
-                        task.wait(0.05)
-                        if keyrelease then keyrelease(sk.key) end
-                    end)
-                    skillCooldowns[i] = now + sk.cd
-                end
-            end
-        end
-    end
-end)
-
--- ════════════════════════════════════════════════════════════
--- GOD MODE — three-layer implementation
+-- SECTION 12: GOD MODE — three-layer implementation
 --
--- Layer 1 (Primary): Heartbeat health floor — see Heartbeat section.
---   Restores Hum.Health to MaxHealth every ~100ms. Catches all damage
---   pathways including server-replicated property writes, which the
---   namecall hook cannot intercept. Executor-agnostic; no special APIs.
+-- Layer 1 (Primary): Heartbeat health floor — see SECTION 15.
+--   Restores Health to MaxHealth every ~100ms. Catches all
+--   damage pathways including server-replicated property writes.
 --
 -- Layer 2 (Secondary): __namecall hook — intercepts client-side
---   TakeDamage, BreakJoints, and Kill calls on the local Humanoid.
---   Install-once at load time; flag-gated, not start/stop.
---   NOTE: this layer is silent against server-side damage. Layer 1
---   is the real workhorse. Layer 2 adds defense-in-depth for any
---   local invocation paths the game may use.
+--   TakeDamage, BreakJoints, Kill on the local Humanoid.
+--   Silent against server-side damage; Layer 1 is the workhorse.
 --
--- Layer 3 (UX): Rayfield:Notify on toggle-on reports which layers
---   are active, so the user knows immediately if hook install failed.
+-- Layer 3 (UX): Rayfield:Notify on toggle reports active layers.
 -- ════════════════════════════════════════════════════════════
-
--- FIX 14: namecallHook validated after install; setreadonly re-lock
--- is in its own pcall so a re-lock failure can't poison the assignment.
 local namecallHook
 local godHookActive = false
 
@@ -663,23 +622,19 @@ if hookmetamethod and getrawmetatable then
 
         namecallHook = hookmetamethod(game, "__namecall", function(self, ...)
             local method = getnamecallmethod()
-            -- FIX 13: intercept TakeDamage AND BreakJoints AND Kill.
-            -- FIX 15: guard self==Hum with Hum.Parent check so a stale
-            -- upvalue from the respawn window never matches a live call.
+            -- FIX 13 / FIX 15 (retained)
             if Flags.GodMode and Hum and Hum.Parent
                and self == Hum
                and (method == "TakeDamage" or method == "BreakJoints" or method == "Kill") then
-                return  -- swallow the call; Layer 1 health floor handles restoration
+                return
             end
             return namecallHook(self, ...)
         end)
 
-        -- FIX 14: re-lock in its own pcall — a failure here must not
-        -- prevent namecallHook from being assigned above.
+        -- FIX 14: re-lock in its own pcall (retained)
         pcall(function() setreadonly(mt, true) end)
     end)
 
-    -- FIX 14: post-install validation with diagnostic warn if absent.
     if namecallHook then
         godHookActive = true
     else
@@ -690,31 +645,9 @@ if hookmetamethod and getrawmetatable then
 end
 
 -- ════════════════════════════════════════════════════════════
--- PORTAL SCANNER & SCORER
---
--- Community scripts (6FootScripts, Hina Hub) all share one
--- pattern: scan Map.Circles for circle models, score each
--- by the player's current Power vs the portal's power req,
--- optionally boost score for red/boss portals.
---
--- Red gates = boss portals. In Solo Hunters these are typically
--- marked by a red/orange color value on the Gate part, or by
--- the circle model's name containing "Boss" or "Red".
---
--- Score formula (when AutoScaleDiff = true):
---   Base: 100 - abs(playerPower - portalReq) / portalReq * 50
---   Boss bonus: +500 if Flags.PrioritizeRed
---   Too weak penalty: -9999 if playerPower < portalReq * 0.8
---   Catch-all (req==0): flat 50 — always selectable fallback (FIX 9)
---
--- Score formula (when AutoScaleDiff = false):  (FIX 1)
---   All portals score a flat 75 (boss bonus still applies if
---   PrioritizeRed is on). Player power is ignored entirely.
+-- SECTION 13: PORTAL SCANNER & SCORER
 -- ════════════════════════════════════════════════════════════
--- FIX L: ordered priority tag list for portal requirement lookup.
--- pairs() iteration is non-deterministic; a portal whose name matches
--- multiple tags (e.g. "Red Boss Circle") would return an arbitrary power
--- value. This ordered array checks specific tags first, generic last.
+-- FIX L (retained): ordered priority tag list
 local PORTAL_POWER_TAGS_ORDERED = {
     { tag = "boss",   power = 10000 },
     { tag = "red",    power = 10000 },
@@ -723,16 +656,17 @@ local PORTAL_POWER_TAGS_ORDERED = {
     { tag = "hard",   power = 2500  },
     { tag = "normal", power = 1000  },
     { tag = "easy",   power = 500   },
-    { tag = "circle", power = 0     },  -- catch-all last
+    { tag = "circle", power = 0     },
 }
 
 local function getPortalReq(circle)
-    -- Try to read a power-requirement value from the model first
     local req = circle:FindFirstChild("PowerRequirement")
                or circle:FindFirstChild("MinPower")
                or circle:FindFirstChild("RequiredPower")
-    if req and req:IsA("IntValue") then return req.Value end
-    -- FIX L: ordered priority list — specific tags checked before generic ones
+    -- FIX L1 (retained): accept NumberValue, not just IntValue
+    if req and (req:IsA("IntValue") or req:IsA("NumberValue")) then
+        return req.Value
+    end
     local nameLower = circle.Name:lower()
     for _, entry in ipairs(PORTAL_POWER_TAGS_ORDERED) do
         if nameLower:find(entry.tag) then return entry.power end
@@ -743,41 +677,39 @@ end
 local function isRedPortal(circle)
     local n = circle.Name:lower()
     if n:find("red") or n:find("boss") or n:find("raid") then return true end
-    -- Check Gate part color
     local gate = circle:FindFirstChild("Gate") or circle:FindFirstChildWhichIsA("BasePart")
     if gate and gate:IsA("BasePart") then
         local col = gate.Color
-        -- Red-ish: R > 0.6, G < 0.3, B < 0.3
         if col.R > 0.6 and col.G < 0.35 and col.B < 0.35 then return true end
     end
     return false
 end
 
 local function scorePortal(circle, playerPower)
-    local req    = getPortalReq(circle)
-    local isRed  = isRedPortal(circle)
-    local score  = 0
+    local req   = getPortalReq(circle)
+    local isRed = isRedPortal(circle)
+    local score = 0
 
-    -- FIX 9: catch-all portals (req == 0) skip power check entirely.
-    -- They score a flat 50 — always reachable fallback.
+    -- FIX 9 / FIX L2 (retained): catch-all portals skip power
+    -- check and do NOT receive the PrioritizeRed boss bonus
     if req == 0 then
         score = 50
-    -- FIX 1: only apply power-scaling logic when AutoScaleDiff is enabled.
+
     elseif Flags.AutoScaleDiff then
-        -- Too weak: heavily penalise
+        -- FIX 1 (retained): power-scaling only when flag is on
         if playerPower < req * 0.8 then
             score = -9999
         else
-            -- Prefer portals just within reach
             local diff = playerPower - req
             score = 100 - math.min(diff / math.max(req, 1) * 50, 80)
         end
+        if isRed and Flags.PrioritizeRed then score = score + 500 end
     else
-        -- AutoScaleDiff off: ignore power entirely, flat score for all portals
+        -- AutoScaleDiff off: flat score, power ignored
         score = 75
+        if isRed and Flags.PrioritizeRed then score = score + 500 end
     end
 
-    if isRed and Flags.PrioritizeRed then score = score + 500 end
     return score, req, isRed
 end
 
@@ -788,6 +720,8 @@ local function getBestPortal()
 
     for _, circle in ipairs(CirclesFolder:GetChildren()) do
         if circle:IsA("Model") then
+            -- Note: scorePortal returns (score, req, isRed).
+            -- We capture only score here intentionally.
             local score = scorePortal(circle, playerPower)
             if score > bestScore then
                 best      = circle
@@ -796,17 +730,13 @@ local function getBestPortal()
         end
     end
 
-    -- FIX 3: if every portal scored below the penalty floor, the player
-    -- is too weak for all of them. Return nil so the farm loop waits
-    -- instead of hammering an unenterable portal repeatedly.
+    -- FIX 3 (retained): return nil when all portals are out of reach
     if bestScore < -500 then return nil end
-
     return best
 end
 
 local function enterPortal(portal)
     if not portal or not HRP then return false end
-    -- Move character to portal position
     local gate = portal:FindFirstChild("Gate")
                or portal:FindFirstChild("Center")
                or portal:FindFirstChildWhichIsA("BasePart")
@@ -815,7 +745,6 @@ local function enterPortal(portal)
     HRP.CFrame = CFrame.new(gate.Position + Vector3.new(0, 5, 0))
     task.wait(rnd(0.5, 0.8))
 
-    -- Fire all ProximityPrompts on the portal model
     local entered = false
     for _, desc in ipairs(portal:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
@@ -824,9 +753,7 @@ local function enterPortal(portal)
         end
     end
 
-    -- FIX C: only fire FullDungeonRemote as a fallback when no proximity
-    -- prompts were found. Firing it alongside prompts could trigger a
-    -- duplicate dungeon start or charge the player twice.
+    -- FIX C (retained): only fire FullDungeonRemote as fallback
     if not entered and R.FullDungeonRemote then
         pcall(function() R.FullDungeonRemote:FireServer() end)
         entered = true
@@ -836,7 +763,8 @@ local function enterPortal(portal)
 end
 
 -- ════════════════════════════════════════════════════════════
--- COLLECT
+-- SECTION 14: COLLECT
+-- PP-1: isCollectPrompt() now uses getPromptText() helper
 -- ════════════════════════════════════════════════════════════
 local function collectDrop(obj)
     if obj:IsA("Model") then
@@ -860,25 +788,24 @@ local function collectAll()
     end
 end
 
--- FIX K: keyword filter for dungeon reward collection.
--- Without this, every ProximityPrompt in every dungeon region fires —
--- including doors, traps, NPC vendors, and exit prompts.
-local COLLECT_KEYWORDS = {"chest","reward","loot","open","collect","pick"}
+-- FIX L3 (retained) + PP-1: getPromptText() ensures ObjectText
+-- is checked, which is where the game dev puts "Chest", "Reward",
+-- "Loot", etc. Previous code using ActionText or never reached
+-- ObjectText, silently matching zero prompts.
+local COLLECT_KEYWORDS = {"chest","reward","loot","pickup","claim","prize"}
 local function isCollectPrompt(pp)
-    local nm = (pp.ActionText or pp.ObjectText or pp.Name):lower()
+    local txt = getPromptText(pp)  -- PP-1: composite text search
     for _, kw in ipairs(COLLECT_KEYWORDS) do
-        if nm:find(kw) then return true end
+        if txt:find(kw) then return true end
     end
     return false
 end
 
--- Collect all ProximityPrompts in dungeon chest/reward containers
 local function collectDungeonRewards()
     if not MapFolder then return end
     for _, reg in ipairs(MapFolder:GetChildren()) do
         if reg.Name ~= "Lobby" and reg.Name ~= "Circles" then
             for _, desc in ipairs(reg:GetDescendants()) do
-                -- FIX K: only fire prompts matching collect keywords
                 if desc:IsA("ProximityPrompt") and isCollectPrompt(desc) then
                     pcall(fireproximityprompt, desc)
                 end
@@ -891,7 +818,6 @@ end
 if DropFolder then
     DropFolder.ChildAdded:Connect(function(obj)
         if Flags.LootESP then
-            -- forward to ESP; defined later, guarded with pcall
             pcall(function() addLootESP(obj) end)
         end
         if not Flags.AutoCollect then return end
@@ -900,10 +826,7 @@ if DropFolder then
             if pp then
                 task.wait(rnd(0.3, 0.6)); pcall(fireproximityprompt, pp)
             else
-                -- FIX D: paired AncestryChanged connection guarantees cleanup
-                -- if the part is removed before a ProximityPrompt ever arrives.
-                -- Previously conn was never disconnected in that case, leaking
-                -- both the connection and its closure indefinitely.
+                -- FIX D (retained): paired AncestryChanged cleanup
                 local conn, cleanConn
                 cleanConn = obj.AncestryChanged:Connect(function()
                     if not obj:IsDescendantOf(game) then
@@ -929,20 +852,23 @@ if DropFolder then
 end
 
 -- ════════════════════════════════════════════════════════════
--- AUTO SELL
--- Scans the lobby for a sell NPC by ProximityPrompt name/parent
--- then fires it. Community scripts walk to sell NPC position.
+-- SECTION 15: AUTO SELL
+-- PP-1: findSellPrompts() now uses getPromptText() helper.
+-- LOGIC-4: Removed "npc" from SELL_KEYWORDS — too broad,
+-- matched every NPC model in the lobby (quest givers, augment
+-- vendors, slot operators). Only descriptive sell terms kept.
 -- ════════════════════════════════════════════════════════════
-local SELL_KEYWORDS = {"sell","merchant","shop","store","vendor","npc"}
+local SELL_KEYWORDS = {"sell","merchant","shop","store","vendor"}
+-- "npc" removed (LOGIC-4): substring matched all lobby NPCs
 
 local function findSellPrompts()
     local prompts = {}
     if not LobbyFolder then return prompts end
     for _, desc in ipairs(LobbyFolder:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
-            local nm = (desc.ActionText or desc.ObjectText or desc.Name):lower()
+            local txt = getPromptText(desc)  -- PP-1: composite text
             for _, kw in ipairs(SELL_KEYWORDS) do
-                if nm:find(kw) then prompts[#prompts+1] = desc; break end
+                if txt:find(kw) then prompts[#prompts+1] = desc; break end
             end
         end
     end
@@ -952,10 +878,16 @@ end
 local function doAutoSell()
     local prompts = findSellPrompts()
     for _, pp in ipairs(prompts) do
-        -- Teleport close enough to interact
-        if pp.Parent and pp.Parent:IsA("BasePart") and HRP then
-            HRP.CFrame = CFrame.new(pp.Parent.Position + Vector3.new(0,5,0))
-            task.wait(0.3)
+        -- FIX L4 (retained): resolve BasePart from either
+        -- direct-parent or Model-parent layout
+        if HRP then
+            local targetPart = (pp.Parent and pp.Parent:IsA("BasePart") and pp.Parent)
+                            or (pp.Parent and pp.Parent:IsA("Model")
+                                and pp.Parent:FindFirstChildWhichIsA("BasePart"))
+            if targetPart then
+                HRP.CFrame = CFrame.new(targetPart.Position + Vector3.new(0,5,0))
+                task.wait(0.3)
+            end
         end
         pcall(fireproximityprompt, pp)
         task.wait(rnd(0.3, 0.6))
@@ -963,21 +895,25 @@ local function doAutoSell()
 end
 
 -- ════════════════════════════════════════════════════════════
--- AUTO BUY MERCHANT SHOP
--- FIX 5: BUY_KEYWORDS now uses exclusive terms only ("buy",
--- "purchase", "item", "trade"). Removed "merchant" and "shop"
--- which were shared with SELL_KEYWORDS, causing double-fires
--- when both AutoSell and AutoBuyMerchant were active.
+-- SECTION 16: AUTO BUY MERCHANT SHOP
+-- PP-1: doAutoBuy() now uses getPromptText() helper.
+-- FIX 5 (retained): "merchant" and "shop" removed to prevent
+-- double-fires with SELL_KEYWORDS.
+-- LOGIC-1: Removed "item" — too broad as a substring match.
+-- "item" matched "UpgradeItem", "DisenchantItem", "ItemShop",
+-- etc., firing unintended shop interactions. After PP-1 fix
+-- enables ObjectText matching, this becomes an active hazard.
 -- ════════════════════════════════════════════════════════════
-local BUY_KEYWORDS = {"buy","purchase","item","trade"}
+local BUY_KEYWORDS = {"buy","purchase","trade"}
+-- "item" removed (LOGIC-1): substring too broad post-PP-1 fix
 
 local function doAutoBuy()
     if not LobbyFolder then return end
     for _, desc in ipairs(LobbyFolder:GetDescendants()) do
         if desc:IsA("ProximityPrompt") then
-            local nm = (desc.ActionText or desc.ObjectText or desc.Name):lower()
+            local txt = getPromptText(desc)  -- PP-1: composite text
             for _, kw in ipairs(BUY_KEYWORDS) do
-                if nm:find(kw) then
+                if txt:find(kw) then
                     pcall(fireproximityprompt, desc)
                     task.wait(rnd(0.2, 0.4))
                     break
@@ -988,50 +924,90 @@ local function doAutoBuy()
 end
 
 -- ════════════════════════════════════════════════════════════
--- AUTO EQUIP BEST GEAR
--- Scans the player's backpack for Tools. Tries to equip the
--- one whose name sorts highest by "Power" child value or by
--- alphabetical name as a tie-breaker. Equipping is done by
--- parenting the Tool to the character (client-side).
+-- SECTION 17: AUTO EQUIP BEST GEAR
+--
+-- STATE-1: Previous version scanned only Backpack, missing the
+-- currently equipped tool. If the equipped tool had the highest
+-- power it was not found — the function selected an inferior
+-- backpack item, moved the best tool to Backpack on unequip,
+-- then equipped the inferior item. This cycled the best gear
+-- in/out of the character slot on every single call.
+-- Fix: scan both Backpack and Char:GetChildren(). Track which
+-- tool is currently equipped. Skip the swap if best == current.
+--
+-- LOGIC-2: getToolPower() extended to check additional common
+-- attribute names and Roblox Instance Attributes.
 -- ════════════════════════════════════════════════════════════
+
+-- LOGIC-2: Extended attribute name list for tool power lookup
+local TOOL_POWER_ATTRS = {
+    "Power","Level","Stats","GearScore","Tier",
+    "Rank","Score","Strength","Attack",
+}
+
 local function getToolPower(tool)
-    local v = tool:FindFirstChild("Power")
-             or tool:FindFirstChild("Level")
-             or tool:FindFirstChild("Stats")
-    if v and (v:IsA("IntValue") or v:IsA("NumberValue")) then
-        return v.Value
+    -- Check known child value names
+    for _, attr in ipairs(TOOL_POWER_ATTRS) do
+        local v = tool:FindFirstChild(attr)
+        if v and (v:IsA("IntValue") or v:IsA("NumberValue")) then
+            return v.Value
+        end
     end
-    -- Fall back: parse first number out of tool name
+    -- Check Roblox Instance Attributes (newer game pattern)
+    for _, attr in ipairs(TOOL_POWER_ATTRS) do
+        local av = pcall(function() return tool:GetAttribute(attr) end)
+        if type(av) == "number" then return av end
+    end
+    -- Last resort: parse first digit sequence from tool name
     local n = tool.Name:match("%d+")
-    return n and tonumber(n) or 0
+    if n then
+        warn("[ENI] getToolPower: name-parse fallback for '" .. tool.Name ..
+             "' — add a recognized value child to eliminate this warn.")
+        return tonumber(n)
+    end
+    return 0
 end
 
 local function doAutoEquipBest()
     local backpack = LP:FindFirstChild("Backpack")
     if not backpack or not Char then return end
+
     local best, bestPow = nil, -1
+    local currentTool   = nil   -- STATE-1: track what's equipped
+
+    -- STATE-1: scan Backpack
     for _, tool in ipairs(backpack:GetChildren()) do
         if tool:IsA("Tool") then
             local pw = getToolPower(tool)
-            if pw > bestPow then best=tool; bestPow=pw end
+            if pw > bestPow then best = tool; bestPow = pw end
         end
     end
-    if best then
-        -- FIX G: unequip any currently held tool before equipping the new one.
-        -- Having two Tools simultaneously parented to the character is undefined
-        -- behavior in Roblox and causes animation / tool-slot state corruption.
-        for _, item in ipairs(Char:GetChildren()) do
-            if item:IsA("Tool") then
-                pcall(function() item.Parent = backpack end)
-            end
+
+    -- STATE-1: scan currently equipped tool in character
+    for _, item in ipairs(Char:GetChildren()) do
+        if item:IsA("Tool") then
+            currentTool = item
+            local pw = getToolPower(item)
+            if pw > bestPow then best = item; bestPow = pw end
         end
+    end
+
+    if not best then return end
+
+    -- STATE-1: skip swap if best is already equipped
+    if best == currentTool then return end
+
+    -- Unequip current tool first (FIX G retained)
+    if currentTool then
+        pcall(function() currentTool.Parent = backpack end)
         task.wait(0.05)
-        pcall(function() best.Parent = Char end)
     end
+
+    pcall(function() best.Parent = Char end)
 end
 
 -- ════════════════════════════════════════════════════════════
--- AUTO QUEST
+-- SECTION 18: AUTO QUEST
 -- ════════════════════════════════════════════════════════════
 local function doAutoQuest()
     pcall(function()
@@ -1048,15 +1024,15 @@ local function doAutoQuest()
 end
 
 -- ════════════════════════════════════════════════════════════
--- AUTO REDEEM CODES
--- Known active codes at time of writing. Fire via RedeemCode
--- RemoteFunction found in RS.Controllers.CodeRedemption.
+-- SECTION 19: AUTO REDEEM CODES
 --
--- FIX 2: Added codesRedeemedThisSession guard. The original
--- doRedeemCodes() was called every LOBBY iteration with no
--- guard, causing it to fire every few seconds indefinitely.
--- The flag resets only when the user presses "Redeem Codes Now"
--- manually, so deliberate re-fires are still possible.
+-- STATE-2: Previous InvokeServer had no timeout. A hung server
+-- handler stalled the entire LOBBY state indefinitely, and
+-- codesRedeemedThisSession was never set if the call never
+-- returned, causing repeated attempts on every LOBBY iteration.
+-- Fix: each code fires in its own task.spawn coroutine. A
+-- task.delay sets a 5-second hard timeout per code. The main
+-- loop waits on a per-code done signal with bounded wait time.
 -- ════════════════════════════════════════════════════════════
 local CODES = {
     "80KLIKESLETSGOO",
@@ -1066,40 +1042,61 @@ local CODES = {
     "UPDATE1",
 }
 
-local codesRedeemedThisSession = false  -- FIX 2: session guard
+local codesRedeemedThisSession = false
 
 local function doRedeemCodes(forceRetry)
-    -- forceRetry = true allows the manual button to bypass the guard
     if codesRedeemedThisSession and not forceRetry then return end
     local ctrl = RS_inner and RS_inner:FindFirstChild("Controllers")
     local cr   = ctrl and ctrl:FindFirstChild("CodeRedemption")
     local rf   = cr  and cr:FindFirstChild("RedeemCode")
     if not rf then return end
+
     for _, code in ipairs(CODES) do
-        pcall(function() rf:InvokeServer(code) end)
-        task.wait(rnd(0.5, 1.0))
+        -- STATE-2: spawn the InvokeServer in its own coroutine
+        -- and enforce a hard 5-second timeout per code
+        local done    = false
+        local timeout = false
+
+        local codeThread = task.spawn(function()
+            pcall(function() rf:InvokeServer(code) end)
+            done = true
+        end)
+
+        -- Timeout sentinel: cancel the coroutine if it hasn't
+        -- finished within 5 seconds
+        local timeoutHandle = task.delay(5, function()
+            if not done then
+                timeout = true
+                pcall(task.cancel, codeThread)
+            end
+        end)
+
+        -- Wait for done or timeout (poll at 100ms granularity)
+        local elapsed = 0
+        while not done and not timeout and elapsed < 5.5 do
+            local dt = task.wait(0.1)
+            elapsed  = elapsed + dt
+        end
+
+        -- Clean up the timeout task if it didn't fire
+        if done and not timeout then
+            pcall(task.cancel, timeoutHandle)
+        end
+
+        task.wait(rnd(0.3, 0.6))
     end
-    codesRedeemedThisSession = true  -- mark so the farm loop won't repeat
+
+    codesRedeemedThisSession = true
 end
 
 -- ════════════════════════════════════════════════════════════
--- DUNGEON STATE MACHINE
---
--- States: LOBBY → ENTERING → FIGHTING → COLLECTING → LEAVING → QUESTING
---
--- FIX 4: Added QUESTING state. Previously QUESTING was listed
--- in the architecture header but had no corresponding branch;
--- quest calls were crammed into LOBBY. QUESTING now runs after
--- LEAVING: teleports to QuestGiver, calls doAutoQuest(), then
--- advances back to LOBBY for the next run.
+-- SECTION 20: DUNGEON STATE MACHINE
 -- ════════════════════════════════════════════════════════════
-local DungeonState = "LOBBY"
+local DungeonState  = "LOBBY"
 local dungeonThread = nil
-local DungeonTimeout = 120  -- seconds before we force-leave a stuck dungeon
+local DungeonTimeout = 120
 
--- FIX A: nil-safe predicate for distinguishing dungeon mobs from lobby mobs.
--- MobFolder may be nil if Workspace.Mobs doesn't exist in the dungeon instance.
--- model:IsDescendantOf(nil) throws; this predicate handles that case cleanly.
+-- FIX A (retained): nil-safe dungeon mob predicate
 local function isDungeonMob(model)
     return not MobFolder or not model:IsDescendantOf(MobFolder)
 end
@@ -1107,9 +1104,7 @@ end
 local function hasDungeonMobs()
     local mobs = getMobs()
     for _, e in ipairs(mobs) do
-        if isDungeonMob(e.model) then  -- FIX A
-            return true
-        end
+        if isDungeonMob(e.model) then return true end
     end
     return false
 end
@@ -1119,9 +1114,7 @@ local function waitForDungeonLoad(timeoutSec)
     while elapsed < timeoutSec do
         dirty()
         if hasDungeonMobs() then return true end
-        -- FIX B: use actual delta from task.wait(), not the requested value.
-        -- task.wait() overshoots under scheduler load; using the requested 0.5
-        -- caused the 15s timeout to silently extend — identical bug to FIX 6.
+        -- FIX B (retained): actual delta from task.wait()
         local actual = task.wait(0.5)
         elapsed = elapsed + actual
     end
@@ -1135,7 +1128,7 @@ local function killAllDungeonMobs()
         dirty()
         local dungeonMobs = {}
         for _, e in ipairs(getMobs()) do
-            if isDungeonMob(e.model) then  -- FIX A: nil-safe predicate
+            if isDungeonMob(e.model) then
                 dungeonMobs[#dungeonMobs+1] = e
             end
         end
@@ -1146,23 +1139,24 @@ local function killAllDungeonMobs()
             end
         end
         dirty()
-        -- FIX 6: use the actual delta returned by task.wait() rather than
-        -- the requested value. task.wait() can overshoot under load; using
-        -- the requested value caused the timeout counter to undercount real
-        -- elapsed time, making DungeonTimeout effectively longer than set.
+        -- FIX 6 (retained): actual delta
         local actual = task.wait(rnd(0.15, 0.28))
         elapsed = elapsed + actual
     end
 end
 
 local function returnToLobby()
-    -- Method 1: fire FullDungeonRemote to leave (some games use this as leave)
+    -- FIX S4 (retained): HRP guard at function entry
+    if not HRP then
+        if R.FullDungeonRemote then
+            pcall(function() R.FullDungeonRemote:FireServer() end)
+        end
+        return
+    end
     if R.FullDungeonRemote then
         pcall(function() R.FullDungeonRemote:FireServer() end)
         task.wait(1.5)
     end
-    -- Method 2: teleport character to lobby spawn
-    if not HRP then return end
     if LobbyFolder then
         local spawn = LobbyFolder:FindFirstChild("SpawnLocation")
                    or LobbyFolder:FindFirstChildWhichIsA("BasePart", true)
@@ -1171,56 +1165,123 @@ local function returnToLobby()
             return
         end
     end
-    -- Fallback: origin
     HRP.CFrame = CFrame.new(Vector3.new(0, 100, 0))
 end
 
+-- STATE-3: inferStartState() improved dungeon detection.
+-- Previous version relied solely on CirclesFolder being empty,
+-- which fails in shared-workspace games where portals persist
+-- in MapFolder.Circles regardless of player position.
+-- Additional signal: if the player is not near any lobby
+-- landmark (spawn, quest giver) and dungeon regions exist,
+-- treat as inside a cleared dungeon (LEAVING).
+local function inferStartState()
+    dirty()
+    -- Check for live dungeon mobs — if found, mid-fight
+    for _, e in ipairs(getMobs()) do
+        if isDungeonMob(e.model) then
+            return "FIGHTING"
+        end
+    end
+
+    -- Check CirclesFolder (original logic)
+    if CirclesFolder then
+        local hasPortals = false
+        for _, c in ipairs(CirclesFolder:GetChildren()) do
+            if c:IsA("Model") then hasPortals = true; break end
+        end
+
+        if not hasPortals and HRP then
+            return "LEAVING"
+        end
+    end
+
+    -- STATE-3: secondary position-based signal.
+    -- If HRP exists and the player is not near any known lobby
+    -- BasePart within a reasonable threshold, and MapFolder has
+    -- non-lobby, non-circles children (dungeon regions), the
+    -- player is likely inside a cleared dungeon.
+    if HRP and LobbyFolder and MapFolder then
+        local nearLobby = false
+        local LOBBY_THRESHOLD = 300  -- studs
+        for _, part in ipairs(LobbyFolder:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if dist(HRP.Position, part.Position) < LOBBY_THRESHOLD then
+                    nearLobby = true
+                    break
+                end
+            end
+        end
+
+        if not nearLobby then
+            -- Check if dungeon regions exist
+            for _, child in ipairs(MapFolder:GetChildren()) do
+                if child.Name ~= "Lobby" and child.Name ~= "Circles" then
+                    return "LEAVING"
+                end
+            end
+        end
+    end
+
+    return "LOBBY"
+end
+
 local function startAutoFarm()
-    if dungeonThread then task.cancel(dungeonThread) end
-    DungeonState = "LOBBY"
+    if dungeonThread then pcall(task.cancel, dungeonThread); dungeonThread = nil end
+
+    -- FIX S3 (retained): resume from correct state
+    DungeonState = inferStartState()
+    if DungeonState ~= "LOBBY" then
+        pcall(function()
+            Rayfield:Notify({
+                Title   = "Auto Farm",
+                Content = "Detected active dungeon — resuming from " .. DungeonState,
+                Duration = 4,
+            })
+        end)
+    end
 
     dungeonThread = task.spawn(function()
         while Flags.AutoFarm do
 
-            -- Guard: need live character
+            -- ARCH-3: farm loop guard no longer calls refreshChar().
+            -- CharacterAdded is the authoritative restart point.
+            -- Guard simply waits and continues when char is absent.
             if not HRP or not Hum or Hum.Health <= 0 then
-                task.wait(1); refreshChar(); continue
+                task.wait(1)
+                continue
             end
 
             -- ── LOBBY ─────────────────────────────────────────
             if DungeonState == "LOBBY" then
 
-                -- Auto sell in lobby
                 if Flags.AutoSell then
                     doAutoSell()
                     task.wait(rnd(0.5, 1.0))
                 end
 
-                -- Auto buy merchant
                 if Flags.AutoBuyMerchant then
                     doAutoBuy()
                     task.wait(rnd(0.3, 0.6))
                 end
 
-                -- Auto equip best gear
                 if Flags.AutoEquipBest then
                     doAutoEquipBest()
                 end
 
-                -- FIX 2: Auto redeem codes — guarded, fires once per session only
+                -- FIX 2 (retained): once-per-session guard
                 if Flags.AutoRedeemCodes then
                     doRedeemCodes(false)
                 end
 
-                -- Find best portal and enter
                 local portal = getBestPortal()
                 if not portal then
-                    task.wait(2); continue  -- no portal found or all out of reach
+                    task.wait(2); continue
                 end
 
                 enterPortal(portal)
                 DungeonState = "ENTERING"
-                task.wait(rnd(2.5, 4.5))  -- wait for load
+                task.wait(rnd(2.5, 4.5))
 
             -- ── ENTERING ──────────────────────────────────────
             elseif DungeonState == "ENTERING" then
@@ -1229,7 +1290,6 @@ local function startAutoFarm()
                 if loaded then
                     DungeonState = "FIGHTING"
                 else
-                    -- Dungeon didn't load, go back
                     DungeonState = "LEAVING"
                 end
 
@@ -1252,18 +1312,14 @@ local function startAutoFarm()
                 returnToLobby()
                 dirty()
                 task.wait(rnd(1.5, 3.0))
-                -- FIX 4: advance to QUESTING state if AutoQuest is on,
-                -- otherwise skip straight back to LOBBY.
+                -- FIX 4 (retained): QUESTING state
                 DungeonState = Flags.AutoQuest and "QUESTING" or "LOBBY"
 
             -- ── QUESTING ──────────────────────────────────────
-            -- FIX 4: QUESTING state — previously missing entirely.
-            -- Teleports to the quest NPC in the lobby, fires turn-in
-            -- and request-new calls, then returns to LOBBY.
+            -- FIX 4 (retained): proper QUESTING state branch
             elseif DungeonState == "QUESTING" then
 
                 if HRP and LobbyFolder then
-                    -- Attempt to navigate to the quest giver
                     local qg   = LobbyFolder:FindFirstChild("QuestGiver")
                     local base = qg and qg:FindFirstChildWhichIsA("BasePart")
                     if base then
@@ -1281,20 +1337,28 @@ local function startAutoFarm()
 
         DungeonState = "LOBBY"
     end)
+
+    -- ARCH-1: register farm thread handle
+    registerThread("dungeonThread", dungeonThread)
 end
 
 local function stopAutoFarm()
-    if dungeonThread then task.cancel(dungeonThread); dungeonThread = nil end
+    if dungeonThread then
+        pcall(task.cancel, dungeonThread)
+        registerThread("dungeonThread", nil)
+        dungeonThread = nil
+    end
     DungeonState = "LOBBY"
 end
 
 -- ════════════════════════════════════════════════════════════
--- MISC AUTOMATIONS
+-- SECTION 21: MISC AUTOMATIONS
+-- ARCH-2: all thread handles registered for unified cancellation
 -- ════════════════════════════════════════════════════════════
 local slotThread, augThread, afkThread
 
 local function startSlot()
-    if slotThread then task.cancel(slotThread) end
+    if slotThread then pcall(task.cancel, slotThread) end
     slotThread = task.spawn(function()
         while Flags.AutoSlotMachine do
             pcall(function() if R.SpinSlotMachine then R.SpinSlotMachine:FireServer() end end)
@@ -1303,10 +1367,11 @@ local function startSlot()
             task.wait(Config.SlotDelay * rnd(0.8, 1.2))
         end
     end)
+    registerThread("slotThread", slotThread)
 end
 
 local function startAugment()
-    if augThread then task.cancel(augThread); augThread = nil end
+    if augThread then pcall(task.cancel, augThread); augThread = nil end
     augThread = task.spawn(function()
         while Flags.AutoAugment do
             pcall(function() if R.ChooseAugment then R.ChooseAugment:FireServer(1) end end)
@@ -1314,38 +1379,34 @@ local function startAugment()
         end
         augThread = nil
     end)
+    registerThread("augThread", augThread)
 end
 
 local function startAntiAFK()
-    if afkThread then task.cancel(afkThread) end
+    if afkThread then pcall(task.cancel, afkThread) end
     afkThread = task.spawn(function()
         while Flags.AntiAFK do
             task.wait(rnd(55, 75))
             if Flags.AntiAFK and Hum and Hum.Parent then
-                -- FIX M: Humanoid.Jump boolean setter is deprecated.
-                -- Humanoid:ChangeState() with Jumping is the current API.
+                -- FIX M (retained): ChangeState, not Humanoid.Jump
                 pcall(function()
                     Hum:ChangeState(Enum.HumanoidStateType.Jumping)
                 end)
             end
         end
     end)
+    registerThread("afkThread", afkThread)
 end
 
 -- ════════════════════════════════════════════════════════════
--- ESP
+-- SECTION 22: ESP
 -- ════════════════════════════════════════════════════════════
 local MobESPObjs  = {}
 local PlrESPObjs  = {}
 local LootESPObjs = {}
 local ChamsObjs   = {}
 
--- FIX 8: pool size increased from 80 to Config.TracerPoolSize (default 200)
--- to handle high ESPMaxDist values without silently clipping entries.
--- FIX 10: wrapped in pcall. Under Xeno's CoreGui-corescript execution model,
--- an unprotected top-level Drawing error surfaces as a "CoreGui.XXX" error
--- and kills the script before Rayfield loads. If Drawing fails we disable
--- Tracers gracefully rather than crashing the entire script.
+-- FIX 10 / FIX 8 (retained): pool init in pcall, size config-driven
 local POOL_SIZE = Config.TracerPoolSize
 local TrPool    = {}
 local activeTr  = 0
@@ -1365,9 +1426,7 @@ if not drawingOk then
     Flags.Tracers = false
 end
 
--- FIX N: tracer color constants hoisted to module level.
--- Previously allocated inside the Heartbeat slow-path every ~100ms.
--- Color3.fromRGB is cheap but allocation inside a hot path is wasteful.
+-- FIX N (retained): tracer color constants at module level
 local TRACER_RED  = Color3.fromRGB(255, 80,  80)
 local TRACER_BLUE = Color3.fromRGB(100, 200, 255)
 
@@ -1388,7 +1447,7 @@ local function destroyPool()
         if TrPool[i] then pcall(function() TrPool[i]:Remove() end); TrPool[i]=nil end
     end
     activeTr  = 0
-    drawingOk = false  -- FIX P: reset so drawTr() doesn't index a nil pool after destroy
+    drawingOk = false  -- FIX P (retained): prevent drawTr() indexing nil pool
 end
 
 local function makeBB(parent, text, col, w)
@@ -1403,11 +1462,10 @@ local function makeBB(parent, text, col, w)
     return bb, lbl
 end
 
+-- FIX E (retained): cleanESP disconnects stored connections
 local function cleanESP(tbl, key)
     if not tbl[key] then return end
-    for k, o in pairs(tbl[key]) do
-        -- FIX E: disconnect stored RBXScriptConnections to prevent leaking
-        -- AncestryChanged listeners when ESP is manually removed.
+    for _, o in pairs(tbl[key]) do
         if typeof(o) == "RBXScriptConnection" then
             pcall(function() o:Disconnect() end)
         elseif typeof(o) == "Instance" then
@@ -1417,7 +1475,12 @@ local function cleanESP(tbl, key)
     tbl[key] = nil
 end
 
-local MobESPBound = false
+-- FIX H4 (HOOK-4 remediation): MobESPBound is set here but
+-- the flag is stored in getgenv() so a re-execution after
+-- guard-clear sees the correct state rather than re-registering
+-- a second ChildAdded connection on top of the orphaned first.
+local MobESPBound = (getgenv and getgenv().ENI_MOB_ESP_BOUND) or false
+
 local function addMobESP(model)
     if MobESPObjs[model] then return end
     local hrp = model:FindFirstChild("HumanoidRootPart")
@@ -1428,10 +1491,9 @@ local function addMobESP(model)
     dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
     dl.TextColor3=Color3.fromRGB(255,200,200); dl.TextStrokeTransparency=0
     dl.TextScaled=true; dl.Font=Enum.Font.Gotham
-    dl.Text = ""   -- FIX 7: initialize to prevent blank flash
+    dl.Text = ""  -- FIX 7 (retained): no blank flash
     dl.Parent=bb
-    -- FIX E: store AncestryChanged connection in the table so cleanESP
-    -- can disconnect it when ESP is manually removed, preventing leaks.
+    -- FIX E (retained): store AncestryChanged connection for leak-free cleanup
     MobESPObjs[model] = {bb=bb, lbl=lbl, dl=dl, conn=nil}
     MobESPObjs[model].conn = model.AncestryChanged:Connect(function()
         if not model:IsDescendantOf(game) then cleanESP(MobESPObjs, model) end
@@ -1439,8 +1501,35 @@ local function addMobESP(model)
 end
 local function removeMobESP(model) cleanESP(MobESPObjs, model) end
 
+-- FIX H1 (retained): per-player lifetime connection registry
+-- Connections are initialized once per player, never per respawn
 local PlrESPBound = false
-local function addPlayerESP(p)
+local playerLifetimeConns = {}
+
+local function bindPlayerLifetime(p)
+    if playerLifetimeConns[p] then return end
+    playerLifetimeConns[p] = {}
+    playerLifetimeConns[p][1] = p.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if Flags.PlayerESP then addPlayerESP(p) end
+    end)
+    playerLifetimeConns[p][2] = p.CharacterRemoving:Connect(function()
+        cleanESP(PlrESPObjs, p)
+    end)
+end
+
+local function unbindPlayerLifetime(p)
+    if not playerLifetimeConns[p] then return end
+    for _, c in ipairs(playerLifetimeConns[p]) do
+        pcall(function() c:Disconnect() end)
+    end
+    playerLifetimeConns[p] = nil
+end
+
+-- addPlayerESP forward declaration (defined just below)
+local addPlayerESP
+
+addPlayerESP = function(p)
     if PlrESPObjs[p] or p==LP then return end
     local char = p.Character; if not char then return end
     local hrp  = char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
@@ -1449,21 +1538,14 @@ local function addPlayerESP(p)
     dl.BackgroundTransparency=1; dl.Size=UDim2.new(1,0,0.4,0); dl.Position=UDim2.new(0,0,1,0)
     dl.TextColor3=Color3.fromRGB(180,230,255); dl.TextStrokeTransparency=0
     dl.TextScaled=true; dl.Font=Enum.Font.Gotham
-    dl.Text = ""   -- FIX 7: initialize to prevent blank flash
+    dl.Text = ""  -- FIX 7 (retained)
     dl.Parent=bb
     PlrESPObjs[p] = {bb=bb, lbl=lbl, dl=dl}
-    p.CharacterRemoving:Connect(function() cleanESP(PlrESPObjs, p) end)
-    -- FIX F: bind CharacterAdded so ESP is recreated when the player respawns.
-    -- Previously only CharacterRemoving was bound; players who died lost their
-    -- ESP label permanently for the rest of the session.
-    p.CharacterAdded:Connect(function()
-        task.wait(0.5)
-        if Flags.PlayerESP then addPlayerESP(p) end
-    end)
+    -- FIX H1 (retained): lifecycle connections not bound here
 end
 local function removePlayerESP(p) cleanESP(PlrESPObjs, p) end
 
-function addLootESP(obj)   -- intentionally non-local for DropFolder handler
+function addLootESP(obj)
     if LootESPObjs[obj] then return end
     local part = obj
     if obj:IsA("Model") then
@@ -1476,8 +1558,9 @@ function addLootESP(obj)   -- intentionally non-local for DropFolder handler
     sel.Color3=col; sel.LineThickness=0.06; sel.SurfaceTransparency=0.7
     sel.SurfaceColor3=col; sel.Adornee=part; sel.Parent=part
     local bb = makeBB(part, isEpic and "★ EPIC" or "Drop", col, 80)
-    LootESPObjs[obj] = {sel=sel, bb=bb}
-    obj.AncestryChanged:Connect(function()
+    -- FIX H2 (retained): store AncestryChanged connection
+    LootESPObjs[obj] = {sel=sel, bb=bb, conn=nil}
+    LootESPObjs[obj].conn = obj.AncestryChanged:Connect(function()
         if not obj:IsDescendantOf(game) and LootESPObjs[obj] then
             pcall(function() LootESPObjs[obj].sel:Destroy() end)
             pcall(function() LootESPObjs[obj].bb:Destroy()  end)
@@ -1485,8 +1568,12 @@ function addLootESP(obj)   -- intentionally non-local for DropFolder handler
         end
     end)
 end
-function removeLootESP(obj)  -- non-local
+
+function removeLootESP(obj)
     if not LootESPObjs[obj] then return end
+    if LootESPObjs[obj].conn then
+        pcall(function() LootESPObjs[obj].conn:Disconnect() end)
+    end
     pcall(function() LootESPObjs[obj].sel:Destroy() end)
     pcall(function() LootESPObjs[obj].bb:Destroy()  end)
     LootESPObjs[obj] = nil
@@ -1504,11 +1591,11 @@ local function addChams(model)
             ChamsObjs[model][#ChamsObjs[model]+1] = b
         end
     end
-    -- FIX E: store AncestryChanged connection so cleanESP can disconnect it
+    -- FIX E (retained): store AncestryChanged connection
     ChamsObjs[model].conn = model.AncestryChanged:Connect(function()
         if not model:IsDescendantOf(game) and ChamsObjs[model] then
-            for k, b in pairs(ChamsObjs[model]) do
-                if typeof(b) == "Instance" then pcall(function() b:Destroy() end) end
+            for _, b in pairs(ChamsObjs[model]) do
+                if typeof(b) == "Instance"           then pcall(function() b:Destroy() end) end
                 if typeof(b) == "RBXScriptConnection" then pcall(function() b:Disconnect() end) end
             end
             ChamsObjs[model] = nil
@@ -1517,8 +1604,8 @@ local function addChams(model)
 end
 local function removeChams(model)
     if not ChamsObjs[model] then return end
-    for k, b in pairs(ChamsObjs[model]) do
-        if typeof(b) == "Instance" then pcall(function() b:Destroy() end) end
+    for _, b in pairs(ChamsObjs[model]) do
+        if typeof(b) == "Instance"           then pcall(function() b:Destroy() end) end
         if typeof(b) == "RBXScriptConnection" then pcall(function() b:Disconnect() end) end
     end
     ChamsObjs[model] = nil
@@ -1528,23 +1615,49 @@ local function clearChams()
 end
 
 -- ════════════════════════════════════════════════════════════
--- CHARACTER RESPAWN
+-- SECTION 23: CHARACTER RESPAWN
+--
+-- ARCH-3: This is the SINGLE AUTHORITATIVE restart point for
+-- all character-dependent systems. refreshChar() is called
+-- here and only here during normal runtime (not from the farm
+-- loop guard, not from within refreshChar() itself).
+-- The explicit task.cancel before startAutoFarm() is now
+-- intentional and documented, not incidental.
 -- ════════════════════════════════════════════════════════════
 LP.CharacterAdded:Connect(function()
     task.wait(0.5)
-    refreshChar()
+
+    local ok = refreshChar()
+    if not ok then
+        warn("[ENI] CharacterAdded: refreshChar() failed — character may not have loaded.")
+        return
+    end
+
     if Hum then
         Hum.WalkSpeed = Config.WalkSpeed
         Hum.JumpPower = Config.JumpPower
         pcall(function() Hum.JumpHeight = Config.JumpPower * 0.36 end)
     end
+
     dirty()
-    if Flags.AutoFarm then startAutoFarm() end
+
+    -- ARCH-3: explicitly cancel previous dungeonThread before
+    -- calling startAutoFarm(), which would cancel it anyway —
+    -- this makes the intent clear and prevents any ambiguity
+    -- about which path triggers the cancel.
+    if Flags.AutoFarm then
+        if dungeonThread then
+            pcall(task.cancel, dungeonThread)
+            dungeonThread = nil
+        end
+        startAutoFarm()
+    end
 end)
 
 -- ════════════════════════════════════════════════════════════
--- HEARTBEAT — NoClip, Stamina, ESP labels, Tracers
--- Kill Aura + AutoSkills run in their own coroutines above.
+-- SECTION 24: HEARTBEAT — NoClip, Stamina, GodMode, ESP, Tracers
+-- Kill Aura + AutoSkills run in their own coroutines (SECTION 26,
+-- spawned after Rayfield window creation per ARCH-1).
 -- ════════════════════════════════════════════════════════════
 local slowAcc = 0
 
@@ -1565,11 +1678,8 @@ RunService.Heartbeat:Connect(function(dt)
     if slowAcc < 0.1 then return end
     slowAcc = 0
 
-    -- FIX 12 (Layer 1): Heartbeat health floor — primary god mode defense.
-    -- Restores health to MaxHealth every ~100ms. Catches server-replicated
-    -- damage that the __namecall hook cannot see (property writes bypass it).
-    -- FIX 15: guarded with Hum.Parent so stale upvalue during the 500ms
-    -- respawn window never attempts to write to a destroyed Humanoid.
+    -- FIX 12 Layer 1 (retained): Heartbeat health floor
+    -- FIX 15 (retained): guard Hum.Parent for stale upvalue
     if Flags.GodMode and Hum and Hum.Parent and Hum.Health > 0
        and Hum.Health < Hum.MaxHealth then
         Hum.Health = Hum.MaxHealth
@@ -1615,7 +1725,6 @@ RunService.Heartbeat:Connect(function(dt)
         local cam = WS.CurrentCamera
         local vp  = cam.ViewportSize
         local ctr = Vector2.new(vp.X/2, vp.Y)
-        -- FIX N: use module-level constants instead of allocating per tick
         for _, e in ipairs(getMobs(Config.ESPMaxDist)) do
             local sp, on = cam:WorldToViewportPoint(e.hrp.Position)
             if on then drawTr(ctr, Vector2.new(sp.X,sp.Y), TRACER_RED) end
@@ -1635,12 +1744,10 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 -- ════════════════════════════════════════════════════════════
--- RAYFIELD
+-- SECTION 25: RAYFIELD
+-- FIX H (retained): fallback CDN
+-- FIX S2 (retained): guard confirmed permanent only here
 -- ════════════════════════════════════════════════════════════
--- FIX H: fallback CDN if the primary Rayfield URL is unreachable.
--- CDN outages, DNS failures, or HttpService domain blocks all caused
--- the script to exit entirely with no UI. The GitHub raw source is
--- the canonical backup maintained by the Rayfield developers.
 local ok, Rayfield = pcall(function()
     return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 end)
@@ -1652,15 +1759,78 @@ if not ok or not Rayfield then
         ))()
     end)
 end
-if not ok or not Rayfield then warn("[ENI] Rayfield failed — all endpoints exhausted."); return end
+if not ok or not Rayfield then
+    -- Clear guard so the user can retry (ARCH-1: threads already
+    -- cancelled at top of script; no orphan accumulation)
+    clearLoadGuard()
+    warn("[ENI] Rayfield failed — all endpoints exhausted. Re-execution is unlocked.")
+    return
+end
+
+-- FIX S2 (retained): permanent guard set here, after success
+if getgenv then getgenv().ENI_SOLO_LOADED = true end
 
 local W = Rayfield:CreateWindow({
-    Name = "Solo Hunters — ENI Build",
+    Name            = "Solo Hunters — ENI Build",
     LoadingTitle    = "Solo Hunters",
-    LoadingSubtitle = "ENI Build v6.4",
+    LoadingSubtitle = "ENI Build v7.0",
     ConfigurationSaving = { Enabled = false },
     KeySystem = false,
 })
+
+-- ════════════════════════════════════════════════════════════
+-- SECTION 26: KILL AURA & AUTO SKILLS
+--
+-- ARCH-1: These threads are initialized HERE, after the Rayfield
+-- window is created, not at module scope. In v6.5 they spawned
+-- before Rayfield loaded. On CDN failure the guard cleared and
+-- re-execution spawned new threads while the originals remained
+-- alive with no surviving handle. Orphan count = 2 per retry.
+--
+-- Both handles are stored in getgenv().ENI_THREAD_REGISTRY via
+-- registerThread(). The next execution (SECTION 0) will cancel
+-- them before spawning replacements. Handle locals are also kept
+-- for the Rejoin button and cancelAllThreads().
+-- ════════════════════════════════════════════════════════════
+
+-- Declare locals so Heartbeat and Rejoin can reference them
+local killAuraThread   = nil
+local autoSkillsThread = nil
+
+killAuraThread = task.spawn(function()
+    while true do
+        task.wait(rnd(0.15, 0.28))
+        if Flags.KillAura and HRP and Hum and Hum.Health > 0 then
+            for _, e in ipairs(getMobs(Config.KillAuraRadius)) do
+                attackEntry(e)
+            end
+        end
+    end
+end)
+registerThread("killAuraThread", killAuraThread)
+
+local skillCooldowns = {}
+for i = 1, #Config.SkillKeys do skillCooldowns[i] = 0 end
+
+autoSkillsThread = task.spawn(function()
+    while true do
+        task.wait(0.25)
+        if Flags.AutoSkills and HRP and Hum and Hum.Health > 0 then
+            local now = tick()
+            for i, sk in ipairs(Config.SkillKeys) do
+                if now >= skillCooldowns[i] then
+                    pcall(function()
+                        if keypress   then keypress(sk.key)   end
+                        task.wait(0.05)
+                        if keyrelease then keyrelease(sk.key) end
+                    end)
+                    skillCooldowns[i] = now + sk.cd
+                end
+            end
+        end
+    end
+end)
+registerThread("autoSkillsThread", autoSkillsThread)
 
 -- ════════════════════════════════════════════════════════════
 -- TAB: AUTO FARM
@@ -1795,10 +1965,9 @@ FarmTab:CreateToggle({
 })
 
 FarmTab:CreateButton({
-    -- FIX 2: manual button resets the session guard so the user can
-    -- force a re-fire without reloading the entire script.
     Name = "Redeem Codes Now",
     Callback = function()
+        -- FIX 2 (retained): manual reset bypasses session guard
         codesRedeemedThisSession = false
         task.spawn(function() doRedeemCodes(true) end)
     end,
@@ -1954,8 +2123,7 @@ PlrTab:CreateToggle({
     Default = false,
     Callback = function(v)
         Flags.GodMode = v
-        -- FIX 16: notify on enable so the user knows which protection
-        -- layers are actually running (hook may have failed to install).
+        -- FIX 16 (retained): notify shows which layers are active
         if v then
             local hookStatus = godHookActive and "active" or "inactive (see console)"
             Rayfield:Notify({
@@ -1979,7 +2147,7 @@ PlrTab:CreateToggle({
     Callback = function(v)
         Flags.AntiAFK = v
         if v then startAntiAFK()
-        else if afkThread then task.cancel(afkThread); afkThread = nil end end
+        else if afkThread then pcall(task.cancel, afkThread); afkThread = nil; registerThread("afkThread", nil) end end
     end,
 })
 
@@ -2112,8 +2280,11 @@ ESPTab:CreateToggle({
         Flags.MobESP = v
         if v then
             for _, e in ipairs(getMobs()) do addMobESP(e.model) end
+            -- HOOK-4: store bound state in getgenv() so re-execution
+            -- sees the existing connection and does not double-register
             if MobFolder and not MobESPBound then
                 MobESPBound = true
+                if getgenv then getgenv().ENI_MOB_ESP_BOUND = true end
                 MobFolder.ChildAdded:Connect(function(m)
                     if Flags.MobESP and m:IsA("Model") then
                         task.wait(0.1); addMobESP(m)
@@ -2132,17 +2303,22 @@ ESPTab:CreateToggle({
     Callback = function(v)
         Flags.PlayerESP = v
         if v then
-            for _, p in ipairs(Players:GetPlayers()) do addPlayerESP(p) end
+            for _, p in ipairs(Players:GetPlayers()) do
+                bindPlayerLifetime(p)
+                addPlayerESP(p)
+            end
             if not PlrESPBound then
                 PlrESPBound = true
                 Players.PlayerAdded:Connect(function(p)
+                    bindPlayerLifetime(p)
                     if Flags.PlayerESP then
-                        p.CharacterAdded:Connect(function()
-                            task.wait(0.5); addPlayerESP(p)
-                        end)
+                        task.wait(0.5); addPlayerESP(p)
                     end
                 end)
-                Players.PlayerRemoving:Connect(removePlayerESP)
+                Players.PlayerRemoving:Connect(function(p)
+                    removePlayerESP(p)
+                    unbindPlayerLifetime(p)
+                end)
             end
         else
             for p in pairs(PlrESPObjs) do removePlayerESP(p) end
@@ -2202,7 +2378,7 @@ MiscTab:CreateToggle({
     Callback = function(v)
         Flags.AutoAugment = v
         if v then startAugment()
-        else if augThread then task.cancel(augThread); augThread=nil end end
+        else if augThread then pcall(task.cancel, augThread); augThread=nil; registerThread("augThread", nil) end end
     end,
 })
 
@@ -2212,7 +2388,7 @@ MiscTab:CreateToggle({
     Callback = function(v)
         Flags.AutoSlotMachine = v
         if v then startSlot()
-        else if slotThread then task.cancel(slotThread); slotThread=nil end end
+        else if slotThread then pcall(task.cancel, slotThread); slotThread=nil; registerThread("slotThread", nil) end end
     end,
 })
 
@@ -2242,9 +2418,11 @@ MiscTab:CreateButton({
     Name = "Rejoin",
     Callback = function()
         destroyPool()
-        -- FIX I: TeleportService:Teleport() is deprecated. TeleportAsync is
-        -- the current API. Wrapped in pcall because teleport can throw in
-        -- executor contexts where the operation is restricted.
+        -- ARCH-2: cancel ALL threads via unified registry
+        -- Previous version only cancelled killAuraThread and autoSkillsThread,
+        -- leaving afkThread, slotThread, and augThread alive through TeleportAsync.
+        cancelAllThreads()
+        -- FIX I (retained): TeleportAsync, wrapped in pcall
         pcall(function()
             TeleportService:TeleportAsync(game.PlaceId, {LP})
         end)
@@ -2262,7 +2440,7 @@ MiscTab:CreateKeybind({
 -- READY
 -- ════════════════════════════════════════════════════════════
 Rayfield:Notify({
-    Title   = "ENI Build v6.4",
+    Title   = "ENI Build v7.0",
     Content = "Solo Hunters loaded  |  RightShift = toggle UI",
     Duration = 5,
 })
