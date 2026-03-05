@@ -589,6 +589,90 @@ local function getMobs(maxD)
     return out
 end
 
+-- ─────────────────────────────────────────────────────────────
+-- getCurrentGateRegion()
+--   Returns the MapFolder child (dungeon region Model) whose
+--   BoundingBox contains the player's HRP, or nil if the player
+--   is in the lobby / world. Uses the same BoundingBox test as
+--   isInsideDungeonRegion() but returns the region itself so
+--   getGateMobs() can scope mob lookups to it.
+-- ─────────────────────────────────────────────────────────────
+local function getCurrentGateRegion()
+    if not HRP or not MapFolder then return nil end
+    local playerPos = HRP.Position
+    for _, child in ipairs(MapFolder:GetChildren()) do
+        if child.Name ~= "Lobby" and child.Name ~= "Circles"
+           and child:IsA("Model") then
+            for _, part in ipairs(child:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    local lp       = part.CFrame:PointToObjectSpace(playerPos)
+                    local half     = part.Size * 0.5
+                    if math.abs(lp.X) <= half.X * 1.5
+                    and math.abs(lp.Y) <= half.Y * 1.5
+                    and math.abs(lp.Z) <= half.Z * 1.5 then
+                        return child
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- getGateMobs()
+--   Returns only mobs that belong to the player's current gate:
+--
+--   Case A — player inside a dungeon region:
+--     Only mobs that are descendants of that specific region
+--     Model in MapFolder. Mobs in other gates / other players'
+--     dungeons are excluded entirely.
+--
+--   Case B — player in lobby / world (no region found):
+--     Only WS.Mobs entries within LOBBY_MOB_RADIUS studs.
+--     This prevents accidentally hitting mobs across the map.
+--
+--   This is the function Kill Aura and Kill All buttons must
+--   use. getMobs() (full cache) is kept for ESP/Tracers which
+--   benefit from seeing everything, and for internal state-
+--   machine use where scoping is already handled separately.
+-- ─────────────────────────────────────────────────────────────
+local LOBBY_MOB_RADIUS = 150  -- studs; covers reasonable lobby combat range
+
+local function getGateMobs()
+    if CacheDirty then rebuildCache() end
+
+    local region = getCurrentGateRegion()
+
+    if region then
+        -- Case A: inside a gate — only mobs that are descendants
+        -- of this specific region subtree in MapFolder.
+        local out = {}
+        for _, e in ipairs(MobCache) do
+            if e.hum.Health > 0
+               and inWS(e.model)
+               and e.model:IsDescendantOf(region) then
+                out[#out + 1] = e
+            end
+        end
+        return out
+    else
+        -- Case B: lobby / world — WS.Mobs only, distance-capped.
+        if not HRP then return {} end
+        local out = {}
+        for _, e in ipairs(MobCache) do
+            if e.hum.Health > 0
+               and inWS(e.model)
+               and MobFolder
+               and e.model:IsDescendantOf(MobFolder)
+               and dist(HRP.Position, e.hrp.Position) <= LOBBY_MOB_RADIUS then
+                out[#out + 1] = e
+            end
+        end
+        return out
+    end
+end
+
 local function getNearestMob(maxD)
     if not HRP then return nil end
     local near, nearD = nil, math.huge
@@ -1211,12 +1295,10 @@ local function killAllDungeonMobs()
     local elapsed = 0
     while elapsed < DungeonTimeout do
         dirty()
-        local dungeonMobs = {}
-        for _, e in ipairs(getMobs()) do
-            if isDungeonMob(e.model) then
-                dungeonMobs[#dungeonMobs + 1] = e
-            end
-        end
+        -- getGateMobs() already scopes to the current gate region,
+        -- so no isDungeonMob() filter needed here — every entry
+        -- returned IS a dungeon mob in the player's current gate.
+        local dungeonMobs = getGateMobs()
         if #dungeonMobs == 0 then break end
         for _, e in ipairs(dungeonMobs) do
             if inWS(e.model) and e.hum.Health > 0 then
@@ -1857,7 +1939,10 @@ killAuraThread = task.spawn(function()
     while true do
         task.wait(rnd(0.15, 0.28))
         if Flags.KillAura and Hum and Hum.Health > 0 then
-            for _, e in ipairs(getMobs()) do  -- nil = all mobs, no radius cap
+            -- getGateMobs() scopes to the player's current gate region.
+            -- Mobs in other players' dungeons or across the map are
+            -- excluded, preventing anti-cheat damage-at-distance kicks.
+            for _, e in ipairs(getGateMobs()) do
                 if e.hum.Health > 0 then
                     attackEntry(e)
                 end
@@ -2050,10 +2135,10 @@ CombTab:CreateButton({
 })
 
 CombTab:CreateButton({
-    Name = "Kill All Mobs Now  (unlimited range)",
+    Name = "Kill All Mobs Now  (current gate only)",
     Callback = function()
         task.spawn(function()
-            for _, e in ipairs(getMobs()) do  -- no radius cap
+            for _, e in ipairs(getGateMobs()) do
                 if e.hum.Health > 0 then attackEntry(e) end
             end
         end)
